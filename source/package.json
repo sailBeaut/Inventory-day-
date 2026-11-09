@@ -1,0 +1,15 @@
+{
+  "name": "inventory-day",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs && cp dist.html ../index.html && cp src/Code.gs ../Code.gs"
+  },
+  "dependencies": {
+    "zxing-wasm": "^3.1.6",
+    "jspdf": "^4.2.1",
+    "qrcode-generator": "^2.0.4",
+    "xlsx": "^0.18.5",
+    "esbuild": "^0.28.2"
+  }
+}
