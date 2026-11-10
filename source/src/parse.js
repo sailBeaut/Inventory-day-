@@ -105,8 +105,22 @@ export function parseLabelText(raw) {
       break;
     }
   }
+  // RS Components stock number: 205-1899 (3–4 digits, dash, 3–4 digits) on its own line
+  const rs = lines.map((l) => /^(\d{3,4}-\d{3,4})$/.exec(l.replace(/\s+/g, ""))).find(Boolean);
+  if (rs) { it.supplierPn = rs[1]; it.supplier = "RS"; }
   const code = lines.map((l) => /^(\d{6,8})\b/.exec(l)).find(Boolean);
-  if (code) it.supplierPn = code[1];
+  if (code && !it.supplierPn) it.supplierPn = code[1];
+  // a part number alone on a line (RS and many other labels): letters + digits, no spaces
+  if (!it.mpn) {
+    for (const l of lines) {
+      const t = l.replace(/\s+/g, "");
+      if (l.split(" ").length > 2 || t.length < 5 || t.length > 32) continue;
+      if (!/^[A-Z0-9][A-Z0-9\-\/.#+_]+$/i.test(t) || /^(\d{3,4}-\d{3,4}|\d+)$/.test(t)) continue;
+      if ((t.match(/\d/g) || []).length >= 1 && (t.match(/[A-Z]/gi) || []).length >= 2 && !/^(rohs|reach|madein)/i.test(t)) { it.mpn = t.toUpperCase(); break; }
+    }
+  }
+  const made = /made\s*(?:in|ln|1n|\\n|\|n)?\s+([A-Za-z]{3,}(?: [A-Za-z]{3,})?)/i.exec(text);
+  if (made && !/^(in|ln)$/i.test(made[1])) it.coo = made[1].trim().replace(/\s+/g, " ");
   const ln = /\bLine\s*0*(\d{1,4})/i.exec(text);
   if (ln) it.line = ln[1].padStart(3, "0");
   return it;

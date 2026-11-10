@@ -42,6 +42,8 @@ const today = () => new Date().toISOString().slice(0, 10);
 const fmtTime = (ms) => new Date(ms).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const U = (s) => String(s || "").trim().toUpperCase();
+// barcode types that appear on part and bag labels (leaving out exotic ones that cause false reads, e.g. DX film edge)
+const LABEL_FORMATS = ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128", "Code39", "Code93", "Codabar", "ITF", "EAN-13", "EAN-8", "UPC-A", "UPC-E", "DataBar", "DataBarExpanded"];
 const is2DFormat = (f) => /DataMatrix|QR|PDF417|Aztec|MaxiCode/.test(f || "");
 const FIELD_LABEL = { mpn: "MPN", qty: "qty", supplierPn: "supplier PN", description: "description", manufacturer: "manufacturer", lot: "lot", dateCode: "date code", line: "line", po: "PO", order: "order" };
 const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -334,7 +336,7 @@ async function decodeFile(file, { decode = true } = {}) {
     for (const side of [2000, 3200]) {
       const c = toCanvas(bmp, side);
       if (!first) first = c;
-      const res = await readBarcodes(c.getContext("2d").getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 40 });
+      const res = await readBarcodes(c.getContext("2d").getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 40, formats: LABEL_FORMATS });
       for (const r of res) if (r.isValid !== false && r.text) seen.set(r.format + "|" + r.text, { format: r.format, text: r.text, pos: relPos(r.position, c.width, c.height) });
       const has2D = [...seen.values()].some((r) => /DataMatrix|QR|PDF417|Aztec/.test(r.format));
       if (has2D || Math.max(bmp.width || 0, bmp.height || 0) <= side) break;
@@ -1035,7 +1037,7 @@ function itemCard(it) {
       input = h("select", { name: k, onchange: (e) => { e.target.blur(); save(k, e.target.value); }, disabled: ro }, h("option", { value: "" }, "—"), ...CATEGORIES.map((c) => h("option", { value: c }, c)));
       input.value = it[k] || "";
     } else {
-      input = h("input", { name: k, "data-f": it.id + ":" + k, value: it[k] ?? "", type: k === "qty" ? "number" : "text", inputmode: k === "qty" ? "numeric" : null, autocomplete: "off", disabled: ro, onchange: (e) => save(k, e.target.value.trim()) });
+      input = h("input", bound(it.id + ":" + k, it[k], (v) => saveItemField(it.id, k, v), { name: k, type: k === "qty" ? "number" : "text", inputmode: k === "qty" ? "numeric" : null, autocomplete: "off", enterkeyhint: "done", disabled: ro }));
     }
     form.append(h("label", { class: k === "description" || k === "notes" ? "wide" : "" }, h("span", {}, label), input));
   }
@@ -1049,6 +1051,7 @@ function itemCard(it) {
     it.hasPhoto && aiOn() && !ro && it.ai !== "pending" ? h("button", { class: "btn small", onclick: () => identifyAgain(it) }, "Ask Claude again") : null,
     q ? h("a", { class: "btn small ghost", href: `https://octopart.com/search?q=${q}`, target: "_blank", rel: "noopener" }, "Look up ↗") : null,
     it.supplier === "Farnell" && /^\d{6,8}$/.test(it.supplierPn || "") ? h("a", { class: "btn small ghost", href: `https://nl.farnell.com/search?st=${it.supplierPn}`, target: "_blank", rel: "noopener" }, "Farnell ↗") : null,
+    it.supplier === "RS" && it.supplierPn ? h("a", { class: "btn small ghost", href: `https://nl.rs-online.com/web/c/?searchTerm=${encodeURIComponent(it.supplierPn)}`, target: "_blank", rel: "noopener" }, "RS ↗") : null,
     ro ? null : h("button", { class: "btn small ghost danger", onclick: () => confirmDelete(it) }, "Delete"));
   card.append(...[
     it.hasPhoto ? photoEl(it.id) : null,
@@ -1116,8 +1119,8 @@ function viewScan() {
       h("div", { class: "row between" }, h("div", { class: "boxbar-label" }, "Filling box"), ro ? null : newBoxBtn),
       boxSelect(currentBox, setCurrentBox, { class: "big", empty: "Pick a box (or scan its label)" }),
       currentBox && box ? h("div", { class: "boxedit" },
-        h("input", { id: "boxname", "data-f": "cur:name", type: "text", placeholder: suggestBoxName(currentBox) ? `Name, e.g. ${suggestBoxName(currentBox)}` : "Name this box", value: box.name || "", disabled: ro, onchange: (e) => write(() => store.update("boxes", currentBox, { name: e.target.value.trim() })) }),
-        h("input", { type: "text", "data-f": "cur:loc", placeholder: "Where is it? e.g. Cabinet 2, shelf 3", value: box.location || "", disabled: ro, onchange: (e) => write(() => store.update("boxes", currentBox, { location: e.target.value.trim() })) })) : null,
+        h("input", bound("box:" + currentBox + ":name", box.name, (v) => saveBoxField(box.id, "name", v), { id: "boxname", type: "text", placeholder: suggestBoxName(currentBox) ? `Name, e.g. ${suggestBoxName(currentBox)}` : "Name this box", disabled: ro, enterkeyhint: "done" })),
+        h("input", bound("box:" + currentBox + ":loc", box.location, (v) => saveBoxField(box.id, "location", v), { type: "text", placeholder: "Where is it? e.g. Cabinet 2, shelf 3", disabled: ro, enterkeyhint: "done" }))) : null,
       h("div", { class: "row between boxbar-sub" },
         h("span", {}, currentBox ? `${plural(inBox, "bag")} in ${currentBox}${box && !box.printed ? " · label not printed yet" : ""}` : "Scan a box label, pick one, or start a new box."),
         currentBox && !ro ? h("button", { class: "btnlink", onclick: () => camBox.click() }, box?.hasPhoto ? "Retake box photo" : "Photo of box") : null), camBox),
@@ -1146,6 +1149,29 @@ function viewScan() {
     ...recentItems.map(itemCard));
 }
 
+function filteredItems() {
+  const qs = search.trim().toLowerCase();
+  let items = state.items.filter((i) => (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
+  if (filterWho) items = items.filter((i) => (filterWho === "__me" ? i.by === state.me : i.by === filterWho));
+  if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
+  if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
+  if (filterFlag === "nodesc") items = items.filter((i) => !i.description);
+  if (qs) items = items.filter((i) => [i.description, i.mpn, i.manufacturer, i.supplierPn, i.category, i.notes, i.box].some((v) => String(v || "").toLowerCase().includes(qs)));
+  return items.sort((a, b) => (b.at || 0) - (a.at || 0));
+}
+function itemsBody() {
+  const items = filteredItems();
+  const total = items.reduce((s2, i) => s2 + (Number(i.qty) || 0), 0);
+  const unlabelled = items.filter((i) => i.needsLabel && !i.labelPrinted);
+  return h("div", { id: "itemsbody" },
+    h("div", { class: "row between summary" }, h("span", {}, `${plural(items.length, "bag")} · ${total.toLocaleString()} pcs`),
+      h("div", { class: "row" },
+        h("button", { class: "btn", disabled: !items.length, onclick: async () => { await commitAll(); partLabelDialog(filteredItems(), filteredItems().filter((i) => i.needsLabel && !i.labelPrinted)); } }, "Part labels"),
+        h("button", { class: "btn primary", disabled: !state.items.length, onclick: async (e) => { e.target.disabled = true; try { await commitAll(); await saveFile(`inventory-${today()}.xlsx`, new Uint8Array(buildWorkbook())); } finally { e.target.disabled = false; } } }, "Export to Excel"))),
+    items.length ? null : h("p", { class: "empty" }, state.items.length ? "Nothing matches." : "Nothing counted yet — start on the Scan tab."),
+    ...items.slice(0, 250).map(itemCard),
+    items.length > 250 ? h("p", { class: "hint" }, `Showing 250 of ${items.length}. Search or filter to narrow down; the export contains everything.`) : null);
+}
 function viewItems() {
   const qs = search.trim().toLowerCase();
   let items = state.items.filter((i) => (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
@@ -1164,17 +1190,11 @@ function viewItems() {
   whoSel.value = filterWho;
   const flagSel = h("select", { onchange: (e) => { e.target.blur(); filterFlag = e.target.value; emit(); } }, h("option", { value: "" }, "All parts"), h("option", { value: "check" }, "Needs checking"), h("option", { value: "label" }, "Needs own label"), h("option", { value: "nodesc" }, "No description"));
   flagSel.value = filterFlag;
-  const searchInput = h("input", { type: "search", id: "search", "data-f": "search", placeholder: "Search part, MPN, category…", value: search, oninput: (e) => { search = e.target.value; clearTimeout(viewItems.t); viewItems.t = setTimeout(() => { render(); const s = $("#search"); s?.focus(); s?.setSelectionRange(s.value.length, s.value.length); }, 200); } });
+  const searchInput = h("input", { type: "search", id: "search", "data-f": "search", placeholder: "Search part, MPN, category…", value: search, enterkeyhint: "search", oninput: (e) => { search = e.target.value; clearTimeout(viewItems.t); viewItems.t = setTimeout(() => { const b = $("#itemsbody"); if (b) b.replaceWith(itemsBody()); }, 200); } });
   const unlabelled = items.filter((i) => i.needsLabel && !i.labelPrinted);
   return h("div", {},
     h("div", { class: "toolbar" }, searchInput, h("div", { class: "filters" }, boxSel, whoSel, flagSel)),
-    h("div", { class: "row between summary" }, h("span", {}, `${plural(items.length, "bag")} · ${total.toLocaleString()} pcs`),
-      h("div", { class: "row" },
-        h("button", { class: "btn", disabled: !items.length, onclick: () => partLabelDialog(items, unlabelled) }, "Part labels"),
-        h("button", { class: "btn primary", disabled: !state.items.length, onclick: async (e) => { e.target.disabled = true; try { await saveFile(`inventory-${today()}.xlsx`, new Uint8Array(buildWorkbook())); } finally { e.target.disabled = false; } } }, "Export to Excel"))),
-    items.length ? null : h("p", { class: "empty" }, state.items.length ? "Nothing matches." : "Nothing counted yet — start on the Scan tab."),
-    ...items.slice(0, 250).map(itemCard),
-    items.length > 250 ? h("p", { class: "hint" }, `Showing 250 of ${items.length}. Search or filter to narrow down; the export contains everything.`) : null);
+    itemsBody());
 }
 function partLabelDialog(inView, unlabelled) {
   let which = unlabelled.length ? "unlabelled" : "view";
@@ -1249,8 +1269,8 @@ function viewBoxes() {
         h("input", { type: "checkbox", checked: pickedForPrint.has(b.id), "aria-label": "Select " + b.id + " for printing", onchange: (e) => { e.target.checked ? pickedForPrint.add(b.id) : pickedForPrint.delete(b.id); savePick(); emit(); } }),
         h("div", { class: "boxcode" }, b.id),
         h("div", { class: "boxfields" },
-          h("input", { type: "text", "data-f": "box:" + b.id + ":name", value: b.name || "", placeholder: sug ? `Suggest: ${sug}` : "Name this box", disabled: ro, onchange: (e) => write(() => store.update("boxes", b.id, { name: e.target.value.trim() })) }),
-          h("input", { type: "text", "data-f": "box:" + b.id + ":loc", class: "loc", value: b.location || "", placeholder: "Location", disabled: ro, onchange: (e) => write(() => store.update("boxes", b.id, { location: e.target.value.trim() })) })),
+          h("input", bound("box:" + b.id + ":name", b.name, (v) => saveBoxField(b.id, "name", v), { type: "text", placeholder: sug ? `Suggest: ${sug}` : "Name this box", disabled: ro, enterkeyhint: "done" })),
+          h("input", bound("box:" + b.id + ":loc", b.location, (v) => saveBoxField(b.id, "location", v), { type: "text", class: "loc", placeholder: "Location", disabled: ro, enterkeyhint: "done" }))),
         h("div", { class: "boxside" },
           h("div", { class: "boxmeta" }, plural(n, "bag"), b.printed ? "" : chip("no label"), filling.length ? chip("● " + filling.join(", "), "live") : null),
           h("div", { class: "row" },
@@ -1287,7 +1307,7 @@ function sheetPanel() {
   const url = inviteUrl();
   const q = qrcode(0, "M"); q.addData(url); q.make();
   const qr = h("div", { class: "qr" }); qr.innerHTML = q.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
-  const nameIn = h("input", { type: "text", "data-f": "myname", value: cfg.name || "", onchange: (e) => { const v = e.target.value.trim(); if (!v) return; cfg = { ...cfg, name: v }; ls.set("cfg", cfg); state.me = v; toast("Name saved", "ok"); sendPresence(); } });
+  const nameIn = h("input", bound("myname", cfg.name, (v) => { if (!v || v === cfg.name) return; cfg = { ...cfg, name: v }; ls.set("cfg", cfg); state.me = v; toast("Name saved", "ok"); sendPresence(); }, { type: "text", enterkeyhint: "done" }));
   return h("section", { class: "panel" },
     h("h2", {}, "Team sheet"),
     h("div", { class: "row between small" },
@@ -1347,8 +1367,47 @@ function cameraIcon() {
   return s;
 }
 
+/* ---- text fields: keep every keystroke and save it, independent of re-renders ---- */
+const drafts = new Map(), draftTimers = new Map(), draftSavers = new Map();
+function bound(key, current, saveFn, extra = {}) {
+  draftSavers.set(key, saveFn);
+  return {
+    ...extra, "data-f": key, value: drafts.has(key) ? drafts.get(key) : current ?? "",
+    oninput: (e) => { drafts.set(key, e.target.value); clearTimeout(draftTimers.get(key)); draftTimers.set(key, setTimeout(() => commitDraft(key), 800)); },
+    onchange: () => commitDraft(key),
+    onblur: () => commitDraft(key),
+  };
+}
+async function commitDraft(key) {
+  clearTimeout(draftTimers.get(key)); draftTimers.delete(key);
+  if (!drafts.has(key)) return;
+  const v = drafts.get(key), fn = draftSavers.get(key);
+  try { if (fn) await fn(String(v).trim()); } catch {}
+  if (drafts.get(key) === v) drafts.delete(key); // keep it if the person typed more meanwhile
+}
+const commitAll = () => Promise.all([...drafts.keys()].map(commitDraft));
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") commitAll(); });
+window.addEventListener("pagehide", () => { commitAll(); });
+async function saveItemField(id, field, raw) {
+  const it = state.items.find((i) => i.id === id);
+  if (!it) return;
+  let v = raw;
+  if (field === "qty") { v = raw === "" ? "" : Number(String(raw).replace(",", ".")); if (Number.isNaN(v)) return; }
+  if ((it[field] ?? "") === v) return;
+  const upd = { [field]: v };
+  if (field === "description" && !it.category) { const g = guessCategory(v); if (g) upd.category = g; }
+  await write(() => store.update("items", id, upd));
+}
+async function saveBoxField(id, field, v) {
+  const b = boxByCode(id);
+  if (!b || (b[field] ?? "") === v) return;
+  await write(() => store.update("boxes", id, { [field]: v }));
+}
+
 function render() {
   const a = document.activeElement;
+  // never swap out a field the person is typing in (on phones that closes the keyboard); render once they leave it
+  if (a && a.tagName === "INPUT" && a.closest?.("#view") && !["checkbox", "radio", "file", "button"].includes(a.type)) { render.pending = true; return; }
   if (a && a.tagName === "SELECT" && a.closest?.("#view")) { render.pending = true; return; }
   if (document.querySelector(".modal-wrap")) { render.pending = true; return; }
   render.pending = false;
