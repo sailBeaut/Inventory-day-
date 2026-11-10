@@ -80,7 +80,7 @@ export function parseTME(text) {
 
 // Farnell / element14 / Newark / CPC bag label: Code128 "LG1" + 9-digit order number + 3-digit line
 export function parseFarnellBarcode(t) {
-  const m = /^LG\d(\d{9})(\d{3})$/.exec(String(t || "").trim());
+  const m = /^[A-Z]{2}\d(\d{9})(\d{3})$/.exec(String(t || "").trim());
   return m ? { supplier: "Farnell", order: m[1], line: m[2] } : null;
 }
 
@@ -92,7 +92,7 @@ export function parseLabelText(raw) {
   const text = String(raw || "").replace(/[‘’`´]/g, "'").replace(/[|]/g, "I");
   const lines = text.split(/\n/).map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
   const it = {};
-  const q = /\b[QO0]\s*[tTlI1]\s*[yYvV]\s*[:.;]?\s*([0-9OoIl][0-9OoIl,.]*)/.exec(text);
+  const q = /\b[QO0a]\s*[tTlI1]\s*[yYvV]\s*[:.;]?\s*([0-9OoIl][0-9OoIl,.]*)/.exec(text);
   if (q) { const n = Number(q[1].replace(/[Oo]/g, "0").replace(/[Il]/g, "1").replace(/[,.]/g, "")); if (Number.isFinite(n) && n > 0 && n < 1e7) it.qty = n; }
   for (const l of lines) {
     if (/^(qty|line|rohs|mod|date|lot|tel|fax|www|\d{6,9}\b)/i.test(l)) continue;
@@ -106,8 +106,14 @@ export function parseLabelText(raw) {
     }
   }
   // RS Components stock number: 205-1899 (3–4 digits, dash, 3–4 digits) on its own line
-  const rs = lines.map((l) => /^(\d{3,4}-\d{3,4})$/.exec(l.replace(/\s+/g, ""))).find(Boolean);
-  if (rs) { it.supplierPn = rs[1]; it.supplier = "RS"; }
+  // NNN-NNNN on its own line: an RS stock number — unless the label says Farnell, which prints its order code as 155-1908 too
+  const farnell = /farn[e3][l1|I]|element ?14|newark/i.test(text);
+  const rs = lines.map((l) => /^[(\[{|]?(\d{3,4}-\d{3,4})(?!\d)/.exec(l.replace(/\s+/g, ""))).find(Boolean);
+  if (rs && farnell) { it.supplierPn = rs[1].replace("-", ""); it.supplier = "Farnell"; }
+  // alone on its line and no quantity printed: RS (Farnell labels always print Qty)
+  else if (rs && it.qty == null && /^\d{3,4}-\d{3,4}$/.test(lines.find((l) => l.replace(/\s+/g, "").includes(rs[1])).replace(/\s+/g, ""))) { it.supplierPn = rs[1]; it.supplier = "RS"; }
+  else if (rs) it.supplierPn = rs[1]; // RS or Farnell — can't tell without the logo
+  if (/\bNXP\b|\bN[XK]P\b|\b12\s?NC\b/i.test(text)) { it.manufacturer = "NXP"; if (!it.supplier) it.supplier = "NXP"; }
   const code = lines.map((l) => /^(\d{6,8})\b/.exec(l)).find(Boolean);
   if (code && !it.supplierPn) it.supplierPn = code[1];
   // a part number alone on a line (RS and many other labels): letters + digits, no spaces
@@ -115,9 +121,14 @@ export function parseLabelText(raw) {
     for (const l of lines) {
       const t = l.replace(/\s+/g, "");
       if (l.split(" ").length > 2 || t.length < 6 || t.length > 32) continue;
-      if (!/^[A-Z0-9][A-Z0-9\-\/.#+_]+$/i.test(t) || /^(\d{3,4}-\d{3,4}|\d+)$/.test(t)) continue;
+      if (!/^[A-Z0-9][A-Z0-9\-\/.#+_]+$/i.test(t) || /^(\d{3,4}-\d{3,4}|\d+$)/.test(t)) continue;
       if ((t.match(/\d/g) || []).length >= 2 && (t.match(/[A-Z]/gi) || []).length >= 2 && !/^(rohs|reach|madein)/i.test(t)) { it.mpn = t.toUpperCase(); break; }
     }
+  }
+  // NXP-style ordering code: type + packing suffix, e.g. 2N7002,215 / BC847B,215
+  if (!it.mpn) {
+    const nx = /\b([0-9A-Z][0-9A-Z\-]{3,20}),\s?(\d{3})\b/.exec(text.toUpperCase());
+    if (nx && /\d/.test(nx[1]) && /[A-Z]/.test(nx[1])) it.mpn = nx[1] + "," + nx[2];
   }
   const made = /made\s*(?:in|ln|1n|\\n|\|n)?\s+([A-Za-z]{3,}(?: [A-Za-z]{3,})?)/i.exec(text);
   if (made && !/^(in|ln)$/i.test(made[1])) it.coo = made[1].trim().replace(/\s+/g, " ");
@@ -271,13 +282,14 @@ export function guessCategory(text, list) {
 // ---- labels with one plain barcode per field (new Farnell / element14, RS, many distributors) ----
 // Which field a printed caption belongs to (EN / NL / DE / FR). Fuzzy, because OCR often gets a letter or two wrong.
 const CAPTION_WORDS = [
-  ["mpn", ["fabrikant", "manufacturer", "hersteller", "fabricant", "mfr", "mfg", "manuf"]],
+  ["mpn", ["fabrikant", "manufacturer", "hersteller", "fabricant", "mfr", "mfg", "manuf", "type", "orderpn", "typenr"]],
   ["custPn", ["klant", "customer", "kunde", "client", "cust"]],
   ["qty", ["hoeveelheid", "quantity", "menge", "anzahl", "aantal", "qty", "quantite"]],
   ["dateCode", ["datumcode", "datecode", "date", "datum"]],
   ["lot", ["lotcode", "lot", "charge", "batch"]],
   ["luid", ["luid", "lu-id"]],
-  ["supplierPn", ["onderdeelnr", "onderdeel", "partno", "part", "bestellnr", "bestellnummer", "ordercode", "stockno"]],
+  ["invoice", ["invoice", "factuur", "rechnung", "facture"]],
+  ["supplierPn", ["onderdeelnr", "onderdeel", "partno", "part", "bestellnr", "bestellnummer", "ordercode", "stockno", "12nc"]],
   ["line", ["artikelnr", "artikel", "line", "lineitem", "item", "pos", "position"]],
   ["description", ["beschr", "beschrijving", "omschrijving", "description", "bezeichnung", "desc"]],
 ];
@@ -288,7 +300,7 @@ function editDistance(a, b) {
   return d[m][n];
 }
 export function classifyCaption(t) {
-  const words = String(t || "").toLowerCase().replace(/[^a-z0-9äöüéè\- ]+/g, " ").split(/\s+/).filter((w) => w.length >= 3);
+  const words = String(t || "").toLowerCase().replace(/([a-z])\/([a-z])/g, "$1$2").replace(/[^a-z0-9äöüéè\- ]+/g, " ").split(/\s+/).filter((w) => w.length >= 3);
   const hit = (kw) => words.some((w) => {
     const ww = w.replace(/nr$|no$/, "");
     if (w === kw || ww === kw) return true;
@@ -359,9 +371,10 @@ export function captionValues(text) {
     if (!f || f in out || f === "luid" || f === "custPn") continue;
     let v = m[2].trim();
     if (f === "description") { if ((v.match(/[A-Za-z]/g) || []).length >= 4) out.description = v.slice(0, 160); continue; }
-    if (!/^[A-Za-z0-9][A-Za-z0-9 .\-\/+#]*$/.test(v)) continue;
+    if (!/^[A-Za-z0-9][A-Za-z0-9 .,\-\/+#_]*$/.test(v)) continue;
+    if (["supplierPn", "invoice", "po"].includes(f)) v = v.replace(/(\d) (?=\d)/g, "$1");
     if (f === "qty") { const n = /^\d[\d.,]*/.exec(v.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1")); if (!n) continue; v = n[0].replace(/[.,]/g, ""); }
-    else if (["mpn", "lot", "supplierPn", "dateCode", "line"].includes(f)) v = v.split(" ")[0].toUpperCase();
+    else if (["mpn", "lot", "supplierPn", "dateCode", "line", "invoice", "po"].includes(f)) v = v.split(" ")[0].replace(/,$/, "").toUpperCase();
     if (v) out[f] = v;
   }
   return out;
