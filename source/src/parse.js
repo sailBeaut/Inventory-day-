@@ -94,8 +94,21 @@ export function parseLabelText(raw) {
   const it = {};
   const q = /\b[QO0a]\s*[tTlI1]\s*[yYvV]\s*[:.;]?\s*([0-9OoIl][0-9OoIl,.]*)/.exec(text);
   if (q) { const n = Number(q[1].replace(/[Oo]/g, "0").replace(/[Il]/g, "1").replace(/[,.]/g, "")); if (Number.isFinite(n) && n > 0 && n < 1e7) it.qty = n; }
+  // "P/N  ASX602-06SN-HE-R", "BATCH 60145511", "Date H2429D", "DESC. PLUG ASSY…" (TE/Deutsch and similar: caption, spaces, value)
   for (const l of lines) {
-    if (/^(qty|line|rohs|mod|date|lot|tel|fax|www|\d{6,9}\b)/i.test(l)) continue;
+    const pn = /^(?:P\s?[\/|lI1]\s?N|PN|PART\s?(?:NO|NUMBER|#)?)\s*[:.~=\-]*\s+[~=\-_]*\s*([A-Z0-9][A-Z0-9\-\/.#+_]{3,40})/i.exec(l);
+    if (pn && /\d/.test(pn[1]) && /[A-Z]/i.test(pn[1]) && !it.mpn) it.mpn = pn[1].toUpperCase();
+    const bt = /(?:BATCH|\bLOT)\s*(?:NO\b|#)?\s*[:.]?\s*([0-9][A-Z0-9\-]{3,20}|(?<=\s)[A-Z](?=[A-Z\-]*\d)[A-Z0-9\-]{3,20})\b/i.exec(l);
+    if (bt && !it.lot) it.lot = bt[1].toUpperCase();
+    const dt = /\bDATE\s*(?:CODE)?\s*[:.;]?\s+([A-Z0-9]{4,8})\b/i.exec(l);
+    if (dt && !it.dateCode && /\d{2}/.test(dt[1])) it.dateCode = dt[1].toUpperCase();
+    const ds = /^DESC(?:RIPTION)?\s*[:.]?\s+(.{4,})$/i.exec(l);
+    if (ds && !it.description && (ds[1].match(/[A-Za-z]/g) || []).length >= 4) it.description = ds[1].replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim().slice(0, 160);
+  }
+  if (/\bDEUTSCH\b/i.test(text)) it.manufacturer = "TE Connectivity (Deutsch)";
+  else if (/TE\s+connectivity|\bconnectivity\b/i.test(text) && !it.manufacturer) it.manufacturer = "TE Connectivity";
+  for (const l of lines) {
+    if (/^(qty|line|rohs|mod|date|lot|batch|desc|p\s?[\/|lI1]\s?n\b|tel|fax|www|\d{6,9}\b)/i.test(l)) continue;
     const m = /^([A-Z0-9][A-Z0-9\-\/.#+_\[\]]{4,40})\s*(?:[:;]\s*|\s+)(.{3,})$/i.exec(l);
     if (!m) continue;
     const tok = m[1].replace(/\[/g, "I").replace(/\]/g, "I");
@@ -130,7 +143,7 @@ export function parseLabelText(raw) {
     const nx = /\b([0-9A-Z][0-9A-Z\-]{3,20}),\s?(\d{3})\b/.exec(text.toUpperCase());
     if (nx && /\d/.test(nx[1]) && /[A-Z]/.test(nx[1])) it.mpn = nx[1] + "," + nx[2];
   }
-  const made = /made\s*(?:in|ln|1n|\\n|\|n)?\s+([A-Za-z]{3,}(?: [A-Za-z]{3,})?)/i.exec(text);
+  const made = /made\s*(?:in|ln|1n|\\n|\|n)?\s+([A-Z]{2}\b|[A-Za-z]{3,}(?: [A-Za-z]{3,})?)/i.exec(text);
   if (made && !/^(in|ln)$/i.test(made[1])) it.coo = made[1].trim().replace(/\s+/g, " ");
   const ln = /\bLine\s*0*(\d{1,4})/i.exec(text);
   if (ln) it.line = ln[1].padStart(3, "0");
