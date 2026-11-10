@@ -570,6 +570,64 @@ async function readLabel(src, codes, opt = {}) {
     return { text, captions, values: captionValues(text), extra };
   } finally { ocrBusy--; emit(); }
 }
+// The part number is what matters most. Find the line captioned with it ("Artikelnr. fabrikant", "Manufacturer Part No",
+// "Mfr. P/N", "Herstellerteilenr.", "P/N", "Type" …), then read just that line again at a few sizes — a single line
+// read on its own is far more accurate than the same line inside a whole label. The value most reads agree on wins.
+const MPN_CAPTION = /(art(?:ikel|\.)?\s*n[ro]\.?\s*fa[bh][a-z]{0,3}[ic]?k?ant|onderdeelnr\.?\s*fab|manuf[a-z]*\s*(part|p\/?n|no|nr|#)|mfr\.?\s*(part|p\/?n|no|#)|mpn|hersteller[a-z\-]*\s*(teil|nr|art)|herstellerteil|r[ée]f[ée]?r?e?n?c?e?\.?\s*fabricant|\bP\s?\/\s?N\b|^\s*type\b|order\s?p\s?\/?\s?n)/i;
+const MPN_VALUE = /[:;]?\s*([A-Z0-9][A-Z0-9 \-\/.,#+_()]{2,40})\s*$/i;
+function cleanMpn(v) {
+  let t = String(v || "").trim().replace(/^[^A-Z0-9]+/i, "").replace(/[^A-Z0-9)]+$/i, "");
+  t = t.replace(/[ .](\d{3})$/, ",$1"); // NXP/Nexperia packing suffix: "74HC2G08DC 125" → "74HC2G08DC,125"
+  t = t.replace(/\s+/g, "");
+  return t.length >= 3 && /\d/.test(t) && /[A-Z]/i.test(t) ? t.toUpperCase() : "";
+}
+async function readMpnLine(src) {
+  const w = await getOcr();
+  await w.setParameters({ tessedit_pageseg_mode: "11" });
+  const page = toCanvas(src, 2000); enhance(page);
+  const { data } = await w.recognize(page, {}, { blocks: true, text: true });
+  const lines = (data?.blocks || []).flatMap((b) => (b.paragraphs || []).flatMap((p) => p.lines || []));
+  // use the caption line's own box: its value sits on the same baseline, to its right
+  const rows = lines.map((l) => ({ text: l.text.trim(), bbox: { ...l.bbox } })).filter((r) => r.bbox.y1 - r.bbox.y0 < 0.06 * page.height);
+  const cap = rows.filter((r) => MPN_CAPTION.test(r.text)).sort((a, b) => (/fab|manuf|mfr|herstell/i.test(b.text) ? 1 : 0) - (/fab|manuf|mfr|herstell/i.test(a.text) ? 1 : 0))[0];
+  if (window.__OCR_DEBUG) window.__mpnRows = rows.map((r) => [r.text, Math.round(r.bbox.x0), Math.round(r.bbox.y0), Math.round(r.bbox.x1), Math.round(r.bbox.y1), MPN_CAPTION.test(r.text)]);
+  if (!cap) return null;
+  const k = src.width / page.width, b = cap.bbox, lh = (b.y1 - b.y0) * k;
+  const x0 = Math.max(0, b.x0 * k - lh), x1 = Math.min(src.width, Math.max(b.x1 * k + 6 * lh, b.x0 * k + 30 * lh));
+  const y0 = Math.max(0, b.y0 * k - 0.35 * lh), y1 = Math.min(src.height, b.y1 * k + 0.35 * lh);
+  await w.setParameters({ tessedit_pageseg_mode: "7" });
+  const reads = [];
+  for (const targetH of [34, 48, 26, 62]) {
+    const sc = targetH / lh, cv = document.createElement("canvas");
+    cv.width = Math.max(8, Math.round((x1 - x0) * sc)); cv.height = Math.max(8, Math.round((y1 - y0) * sc));
+    cv.getContext("2d", { willReadFrequently: true }).drawImage(src, x0, y0, x1 - x0, y1 - y0, 0, 0, cv.width, cv.height);
+    const r = (await w.recognize(cv)).data;
+    const t = (r?.text || "").replace(/\s+/g, " ").trim();
+    const m = MPN_CAPTION.exec(t);
+    const after = m ? t.slice(m.index + m[0].length) : t;
+    const v = cleanMpn((MPN_VALUE.exec(after) || [])[1] || "");
+    if (v) reads.push({ v, conf: r?.confidence || 0 });
+    if (window.__OCR_DEBUG) (window.__mpnLines = window.__mpnLines || []).push([targetH, t]);
+  }
+  if (!reads.length) return null;
+  const votes = new Map();
+  for (const r of reads) { const e = votes.get(r.v) || { n: 0, conf: 0 }; e.n++; e.conf = Math.max(e.conf, r.conf); votes.set(r.v, e); }
+  let [best] = [...votes.entries()].sort((a, b) => b[1].n - a[1].n || b[1].conf - a[1].conf)[0];
+  // per character: among reads of the most common length, each position takes the character most reads show
+  const lens = new Map(); for (const r of reads) lens.set(r.v.length, (lens.get(r.v.length) || 0) + 1);
+  const L = [...lens.entries()].sort((a, b) => b[1] - a[1] || (b[0] === best.length) - (a[0] === best.length))[0][0];
+  const same = reads.filter((r) => r.v.length === L);
+  if (same.length >= 3) {
+    let out = "";
+    for (let i = 0; i < L; i++) {
+      const c = new Map(); for (const r of same) c.set(r.v[i], (c.get(r.v[i]) || 0) + 1);
+      const top = Math.max(...c.values()), cands = [...c.keys()].filter((ch) => c.get(ch) === top);
+      out += cands.includes(best[i]) ? best[i] : cands[0];
+    }
+    best = out;
+  }
+  return { mpn: best, agree: reads.filter((r) => r.v === best).length, reads: reads.length };
+}
 function textExtras(txt, _lines) {
   const extra = {};
   if (/farnell|element ?14|newark/i.test(txt)) extra.supplier = "Farnell";
@@ -581,7 +639,7 @@ function textExtras(txt, _lines) {
     const m = /(?:^|\s)(fabrikant|manufacturer|hersteller|fabricant)\s*:?\s*([A-Za-z][A-Za-z0-9 &.\-]{1,30})?$/i.exec(ls2[i]);
     if (!m || /nr|part|no\b/i.test(ls2[i].slice(0, m.index + 1))) continue;
     const val = (m[2] || ls2[i + 1] || "").trim();
-    if (/^[A-Za-z][A-Za-z0-9 &.\-]{1,30}$/.test(val) && !classifyCaption(val)) { extra.manufacturer = val; break; }
+    if (/^[A-Za-z][A-Za-z0-9 &.\-]{1,30}$/.test(val) && (val.match(/[A-Za-z]/g) || []).length >= 3 && !classifyCaption(val)) { extra.manufacturer = val; break; }
   }
   return extra;
 }
@@ -717,7 +775,7 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   };
   // square code without a part number (Mouser China labels): the MPN is one of the stripe barcodes
   if (r.has2DData && !merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
-  let ocrUsed = false;
+  let ocrUsed = false, mpnAgree = 0;
   const needText = () => !merged.mpn || merged.qty == null || (!opts.live && !merged.description);
   if (mode !== "loose" && ocrAvailable() && media?.ocrCanvas && needText()) {
     const oneD = (r.all || []).filter((c) => !is2DFormat(c.format));
@@ -755,6 +813,11 @@ async function handleDecoded(codes, media, mode, opts = {}) {
           delete t[f];
           break;
         }
+      }
+      // the part number line, read on its own (only when no code gave the MPN)
+      if ((!opts.live || opts.mpnLine) && !merged.mpn) {
+        const ml = await readMpnLine(media.ocrCanvas).catch(() => null);
+        if (ml && (!t.mpn || ml.agree >= 2 || cleanMpn(t.mpn) === ml.mpn)) { t.mpn = ml.mpn; mpnAgree = ml.agree; }
       }
       put(t, "text");
       if (merged.supplierPn && src.supplierPn === "text" && U(merged.supplierPn) === U(merged.mpn)) { delete merged.supplierPn; delete src.supplierPn; }
@@ -819,7 +882,8 @@ async function handleDecoded(codes, media, mode, opts = {}) {
     const groups = {};
     for (const [k, v] of Object.entries(readFrom)) if (FIELD_LABEL[k]) (groups[v] = groups[v] || []).push(FIELD_LABEL[k]);
     item.readFrom = Object.entries(groups).map(([how, ks]) => `${how}: ${ks.join(", ")}`).join(" · ");
-    if (!item.fromOrder && (fromText.includes("mpn") || fromText.includes("qty") || (fromText.includes("supplierPn") && !item.mpn))) item.needsCheck = true;
+    // flag what matters: a part number read from text that several separate reads didn't agree on
+    if (!item.fromOrder && ((fromText.includes("mpn") && mpnAgree < 3) || (fromText.includes("supplierPn") && !item.mpn))) item.needsCheck = true;
     if (r.multi && !item.fromOrder && !item.mpn) item.needsCheck = true;
   }
   if (!item.category && item.description) item.category = guessCategory(item.description, item.list);
@@ -883,7 +947,18 @@ async function saveCountField(id, v) {
 function countPrompt(it, opt = {}) {
   return new Promise((resolve) => {
     const inp = h("input", { type: "number", inputmode: "numeric", min: "0", class: "countin", placeholder: "How many?", enterkeyhint: "done", "aria-label": "Counted quantity" });
-    const finish = async (fn) => { wrap.remove(); try { await fn(); } finally { resolve(); } };
+    // the part number is what matters most: when it came from label text (or is missing), show it here to confirm or fix
+    const askPn = !!(it.needsCheck || !it.mpn);
+    const pnIn = askPn ? h("input", { type: "text", class: "pnin", value: it.mpn || "", placeholder: "Type the part number from the label", autocapitalize: "characters", autocomplete: "off", spellcheck: "false", "aria-label": "Part number" }) : null;
+    let pnOk = false;
+    pnIn?.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); pnOk = true; inp.focus(); } }); // Enter = checked
+    const pnSave = async () => {
+      if (!pnIn) return;
+      const v = pnIn.value.trim().toUpperCase();
+      if (v && v !== (it.mpn || "")) await write(() => store.update("items", it.id, { mpn: v, needsCheck: false }));
+      else if (pnOk && v) await write(() => store.update("items", it.id, { needsCheck: false }));
+    };
+    const finish = async (fn) => { wrap.remove(); try { await pnSave(); await fn(); } finally { resolve(); } };
     const save = () => {
       const v = inp.value.trim();
       if (v === "") { inp.focus(); return; }
@@ -896,6 +971,8 @@ function countPrompt(it, opt = {}) {
       h("div", { class: "modal count" },
         h("div", { class: "count-title" }, it.description || it.mpn || "This bag"),
         h("div", { class: "small" }, [it.mpn && it.description ? it.mpn : "", it.box || "no box", opt.sameBags ? `bag ${opt.sameBags + 1} of this part` : ""].filter(Boolean).join(" · ")),
+        askPn ? h("label", { class: "count-label pn" }, it.mpn ? "Part number — check it against the label:" : "Part number not read — type it from the label:", h("div", { class: "pnrow" }, pnIn,
+          it.mpn ? h("button", { class: "btn small", onclick: (e) => { pnOk = true; e.currentTarget.textContent = "✓ Correct"; e.currentTarget.disabled = true; inp.focus(); } }, "Correct") : null)) : null,
         h("label", { class: "count-label" }, "How many parts are in this bag?", inp),
         it.qty != null && it.qty !== "" ? h("button", { class: "btnlink", onclick: () => { inp.value = String(it.qty); inp.focus(); } }, `Label says ${it.qty} (not verified) — use as starting point`) : null,
         h("div", { class: "small" }, "0 = scanned by mistake (removes this bag)."),
@@ -976,7 +1053,14 @@ async function openLive() {
       continue;
     }
     if (!r.partRef && !r.has2DData && !r.known1D) continue;
-    if (r.multi && !(r.multi.fields.mpn && r.multi.fields.qty != null)) {
+    // multi-barcode label still missing its part-number barcode: wait up to 4 s, then read the part-number line as text
+    let readPnLine = false;
+    const wk = r.multi?.fields.supplierPn ? "sp:" + r.multi.fields.supplierPn : ""; // frames catch different barcodes: key on the order code
+    if (wk && !r.multi.fields.mpn) {
+      const t0 = waitPn.get(wk) || now; waitPn.set(wk, t0);
+      if (now - t0 >= 4000) readPnLine = true;
+    }
+    if (!readPnLine && r.multi && !(r.multi.fields.mpn && r.multi.fields.qty != null)) {
       const f = r.multi.fields;
       const same = lastLive && f.supplierPn && lastLive.supplierPn === f.supplierPn && (!f.lot || lastLive.lot === f.lot);
       flash(same ? "✓ Done — show the next bag" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the rest…`, same ? "ok" : "box");
@@ -989,13 +1073,15 @@ async function openLive() {
     }
     waitPn.delete(key);
     let media = null;
-    if (!r.has2DData && r.known1D) {
+    if (readPnLine || (!r.has2DData && r.known1D)) {
       flash("Hold still — reading label text…", "box");
       const snap = document.createElement("canvas"); snap.width = video.videoWidth; snap.height = video.videoHeight;
       snap.getContext("2d").drawImage(video, 0, 0);
       media = { ocrCanvas: snap };
     }
-    const out = await handleDecoded(codes, media, "bag", { live: true });
+    if (readPnLine) flash("Reading the part number text…", "box");
+    const out = await handleDecoded(codes, media, "bag", { live: true, mpnLine: readPnLine });
+    waitPn.delete(key); if (wk) waitPn.delete(wk);
     if (out?.kind === "added") {
       count++; beep(880); flash("✓ " + out.text, "ok"); lastLive = out.item;
       for (const x of codes) codeOwner.set(x.text, { key, at: Date.now() }); // later partial reads of this label are the same bag
