@@ -246,9 +246,24 @@ const CAT_RULES = [
   ["IC", /\bic\b|amplifier|op-?amp|regulator|\bldo\b|converter|driver|transceiver|comparator|\badc\b|\bdac\b|logic|eeprom|flash|memory|controller|interface|isolator|optocoupler|\bcan\b/i],
   ["Mechanical", /screw|\bnut\b|standoff|spacer|enclosure|heat ?sink|washer|bracket|cable tie/i],
 ];
-export function guessCategory(text) {
+export const WH_CATEGORIES = ["Connector housing", "Terminal/Crimp contact", "Wire/Cable", "Heat shrink", "Sleeving/Braid", "Backshell/Boot", "Seal/Plug/Lock", "Cable tie/Mount", "Fuse/Relay", "Label/Marker", "Tool", "Other"];
+const WH_RULES = [
+  ["Terminal/Crimp contact", /terminal|crimp|contact|socket pin|\bpin\b|ferrule|splice|ring tongue|faston/i],
+  ["Heat shrink", /heat ?shrink|krimpkous|shrink tube|hellermann.*shrink/i],
+  ["Sleeving/Braid", /sleev|braid|loom|conduit|spiral wrap|expandable/i],
+  ["Backshell/Boot", /backshell|boot|strain relief/i],
+  ["Seal/Plug/Lock", /seal|blank|cavity plug|wedge|wedgelock|tpa|cpa|secondary lock|grommet/i],
+  ["Connector housing", /housing|connector|plug|receptacle|deutsch|molex|ampseal|superseal|micro-?fit|jst|header/i],
+  ["Wire/Cable", /\bwire\b|cable|\bawg\b|mm²|mm2|litz|twisted pair/i],
+  ["Cable tie/Mount", /cable tie|tie wrap|\bmount\b|p-?clip|clip|clamp|edge clip/i],
+  ["Fuse/Relay", /fuse|relay/i],
+  ["Label/Marker", /label|marker|sleeve marker/i],
+  ["Tool", /tool|crimper|extractor|insertion/i],
+];
+export function guessCategory(text, list) {
   const t = String(text || "");
   if (!t) return "";
+  if (list === "wh") { for (const [c, re] of WH_RULES) if (re.test(t)) return c; return ""; }
   for (const [c, re] of CAT_RULES) if (re.test(t)) return c;
   return "";
 }

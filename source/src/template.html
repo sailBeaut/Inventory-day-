@@ -151,11 +151,29 @@ textarea.code{width:100%;font:12px/1.4 ui-monospace,Menlo,monospace;background:v
 .live-top{grid-area:1/1;align-self:start;display:flex;gap:10px;align-items:center;justify-content:space-between;padding:calc(12px + env(safe-area-inset-top)) 14px 12px;background:linear-gradient(rgba(0,0,0,.6),transparent);color:#fff;font-weight:600}
 .live-last{grid-area:1/1;align-self:end;margin:0 14px calc(22px + env(safe-area-inset-bottom));padding:14px;border-radius:12px;background:rgba(0,0,0,.65);color:#fff;font-size:16px;font-weight:600;text-align:center}
 .live-last.ok{background:var(--ok)}.live-last.warn{background:#b54708}.live-last.box{background:var(--acc)}
+
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--line);padding:4px;border-radius:12px;margin-bottom:10px}
+.seg button{appearance:none;border:0;background:none;font:inherit;font-weight:600;color:var(--mute);padding:9px 6px;border-radius:9px;cursor:pointer;min-height:40px}
+.seg button.on{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+.seg .n{font-weight:500;color:var(--mute)}
+.tag.count{background:#eef4fb;border-color:#b9d3f0;color:#0b4f96}
+@media (prefers-color-scheme:dark){.tag.count{background:#15263a;border-color:#2c4a6e;color:#9cc7f5}}
+.countrow{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end;background:var(--soft);border-radius:10px;padding:8px 10px}
+.countrow label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--ink);font-weight:700}
+.countrow input{font-size:20px;font-weight:700}
+.countside{display:grid;justify-items:end;gap:2px;padding-bottom:4px}
+.count-wrap{z-index:60;align-items:end;padding:0}
+.modal.count{max-width:520px;border-radius:18px 18px 0 0;padding:18px 18px calc(18px + env(safe-area-inset-bottom));display:grid;gap:8px}
+@media (min-width:600px){.count-wrap{align-items:center;padding:20px}.modal.count{border-radius:18px}}
+.count-title{font-size:17px;font-weight:700}
+.count-label{display:grid;gap:6px;font-weight:600;font-size:14px;margin-top:4px}
+.countin{font-size:30px !important;font-weight:700;text-align:center;padding:12px !important}
+.count-btns{display:grid;grid-template-columns:1.4fr 1fr 0.8fr;gap:8px;margin-top:4px}
 </style>
 </head>
 <body>
 <header><div class="top">
-<h1>Inventory Day <small>· electronics &amp; PCB parts</small></h1>
+<h1>Inventory Day <small>· electrical &amp; WH parts</small></h1>
 <nav>
 <button id="tab-scan">Scan<span class="n"></span></button>
 <button id="tab-items">Parts<span class="n"></span></button>

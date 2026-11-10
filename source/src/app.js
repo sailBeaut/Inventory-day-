@@ -3,7 +3,7 @@ import wasmBin from "../node_modules/zxing-wasm/dist/reader/zxing_reader.wasm";
 import { jsPDF } from "jspdf";
 import qrcode from "qrcode-generator";
 import * as XLSX from "xlsx";
-import { interpret, printable, BOX_PREFIX, PART_PREFIX, parseOrderRows, guessCategory, parseLabelText, resolveBarcodes, classifyCaption, parseFarnellBarcode, captionValues } from "./parse.js";
+import { interpret, printable, BOX_PREFIX, PART_PREFIX, parseOrderRows, guessCategory, parseLabelText, resolveBarcodes, classifyCaption, parseFarnellBarcode, captionValues, WH_CATEGORIES } from "./parse.js";
 import { sheetStore } from "./sheet.js";
 import SCRIPT_SOURCE from "./Code.gs";
 
@@ -52,9 +52,13 @@ function fileInput(opts, onFiles) {
 }
 
 const CATEGORIES = ["Resistor", "Capacitor", "Inductor", "Diode/LED", "Transistor/MOSFET", "IC", "Microcontroller", "Connector", "Cable/Wire", "Crystal/Oscillator", "Fuse/Protection", "Switch/Button", "Sensor", "Module/PCB", "Mechanical", "Other"];
+// Two separate lists: electrical / PCB parts, and wiring-harness (WH) parts. Each has its own boxes (B001… / W001…).
+const LISTS = { el: { name: "Electrical", prefix: "B" }, wh: { name: "Wiring harness (WH)", prefix: "W" } };
+const listOf = (x) => (x && x.list === "wh" ? "wh" : "el");
+const catsFor = (l) => (l === "wh" ? WH_CATEGORIES : CATEGORIES);
 const FIELDS = [
   ["description", "Description"], ["category", "Category"], ["manufacturer", "Manufacturer"], ["mpn", "Manufacturer PN"],
-  ["supplier", "Supplier"], ["supplierPn", "Supplier PN"], ["qty", "Qty"], ["notes", "Notes"],
+  ["supplier", "Supplier"], ["supplierPn", "Supplier PN"], ["qty", "Label qty (not verified)"], ["notes", "Notes"],
 ];
 
 /* ================= store ================= */
@@ -229,15 +233,29 @@ function teamNow() {
 /* ================= boxes ================= */
 const boxByCode = (code) => state.boxes.find((b) => b.id === code);
 let currentBox = ls.get("currentBox", "");
-function setCurrentBox(code) { currentBox = code; ls.set("currentBox", code); sendPresence(); emit(); }
-function maxBoxNum() { let m = 0; for (const b of state.boxes) { const x = /^B(\d+)$/.exec(b.id); if (x) m = Math.max(m, Number(x[1])); } return m; }
+let currentList = ls.get("list", "el") === "wh" ? "wh" : "el";
+function setList(l) {
+  currentList = l === "wh" ? "wh" : "el"; ls.set("list", currentList);
+  if (currentBox && listOf(boxByCode(currentBox)) !== currentList) { currentBox = ""; ls.set("currentBox", ""); }
+  filterBox = ""; sendPresence(); emit();
+}
+function setCurrentBox(code) {
+  currentBox = code; ls.set("currentBox", code);
+  const b = boxByCode(code);
+  if (b && listOf(b) !== currentList) { currentList = listOf(b); ls.set("list", currentList); toast(`Switched to the ${LISTS[currentList].name} list`, "ok"); }
+  sendPresence(); emit();
+}
+const listForBoxCode = (code) => (/^W\d+$/i.test(code || "") ? "wh" : "el");
+const itemListNow = () => (currentBox && boxByCode(currentBox) ? listOf(boxByCode(currentBox)) : currentList);
+function maxBoxNum(prefix) { let m = 0; for (const b of state.boxes) { const x = new RegExp("^" + prefix + "(\\d+)$").exec(b.id); if (x) m = Math.max(m, Number(x[1])); } return m; }
 async function addBoxes(names) {
   const made = [];
-  let n = maxBoxNum();
+  const prefix = LISTS[currentList].prefix;
+  let n = maxBoxNum(prefix);
   for (let i = 0; i < names.length; i++) {
     let code;
-    do { n++; code = "B" + pad(n); } while (state.boxes.some((b) => b.id === code) || ((state.mode === "shared" || state.mode === "sheet") && (await store.exists("boxes", code))));
-    const ok = await write(() => store.set("boxes", code, { name: names[i] || "", location: "", printed: false, createdAt: Date.now(), by: state.me || "" }));
+    do { n++; code = prefix + pad(n); } while (state.boxes.some((b) => b.id === code) || ((state.mode === "shared" || state.mode === "sheet") && (await store.exists("boxes", code))));
+    const ok = await write(() => store.set("boxes", code, { name: names[i] || "", location: "", printed: false, createdAt: Date.now(), by: state.me || "", list: currentList }));
     if (!ok) break;
     made.push(code);
   }
@@ -274,7 +292,7 @@ function fillFromCatalog(it) {
   if (!out.mpn && r.m) out.mpn = r.m;
   if (!out.supplierPn && r.sp) out.supplierPn = r.sp;
   if (!out.supplier && r.s) out.supplier = r.s;
-  if (!out.category) out.category = guessCategory(out.description) || "";
+  if (!out.category) out.category = guessCategory(out.description, out.list) || "";
   return out;
 }
 async function importOrderFile(file) {
@@ -504,7 +522,7 @@ let aiBusy = false, aiPaused = false;
 const aiAvailable = () => !!(sample && canImages);
 const aiOn = () => aiAvailable() && ls.get("useClaude", true);
 function queueAI(id, photo, known, mode) { aiQueue.push({ id, photo, known, mode }); pumpAI(); emit(); }
-function aiPrompt(known, mode) {
+function aiPrompt(known, mode, cats = CATEGORIES) {
   return `You are helping a student racing team count their electronics stock. ${mode === "loose"
     ? "The photo shows a component or loose parts WITHOUT a supplier label (maybe on a reel, in a tray, bare, or in an unlabelled bag)."
     : "The photo shows a bag, reel or box of components, usually with a supplier label."}
@@ -512,7 +530,7 @@ Barcodes decoded from the photo and matches from the team's order history (trust
 Work out what the part is. Read any printed label first. If there is no label, identify it from what you can see: chip or package markings (read them exactly), SMD resistor/capacitor codes, colour bands, connector series and pitch, size and package.
 Reply with only one JSON object with these keys:
 {"description": short plain description incl. value and package, e.g. "10 kΩ resistor, 0603" or "Red LED, 0603 SMD",
- "category": one of ${JSON.stringify(CATEGORIES)},
+ "category": one of ${JSON.stringify(cats)},
  "manufacturer": "", "mpn": "" (only when printed or marked on it — never guess), "supplier": "", "supplierPn": "",
  "qty": number or null (only when printed),
  "confidence": "high" | "medium" | "low",
@@ -525,7 +543,9 @@ async function pumpAI() {
   const job = aiQueue.shift();
   emit();
   try {
-    const r = await sample.json(aiPrompt(job.known, job.mode), { images: [job.photo], modelTier: job.mode === "loose" ? "default" : "quick" });
+    const jobItem = state.items.find((i) => i.id === job.id);
+    const cats = catsFor(listOf(jobItem));
+    const r = await sample.json(aiPrompt(job.known, job.mode, cats), { images: [job.photo], modelTier: job.mode === "loose" ? "default" : "quick" });
     const it = state.items.find((i) => i.id === job.id) || (await store.get("items", job.id));
     if (it && r && typeof r === "object") {
       const upd = { ai: "done" };
@@ -534,7 +554,7 @@ async function pumpAI() {
         if (v && !it[k]) upd[k] = v.slice(0, 200);
       }
       if ((it.qty == null || it.qty === "") && r.qty != null && r.qty !== "" && Number.isFinite(Number(r.qty))) upd.qty = Number(r.qty);
-      if (upd.category && !CATEGORIES.includes(upd.category)) upd.category = "Other";
+      if (upd.category && !cats.includes(upd.category)) upd.category = "Other";
       const conf = ["high", "medium", "low"].includes(r.confidence) ? r.confidence : "";
       if (conf) upd.aiConfidence = conf;
       if (typeof r.seen === "string" && r.seen.trim()) upd.aiSeen = r.seen.trim().slice(0, 200);
@@ -567,9 +587,12 @@ async function handleFiles(files, mode = "bag") {
   const list = [...files].sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
   processing += list.length; emit();
   for (const file of list) {
-    try { await handleOne(file, mode); }
+    let out = null;
+    try { out = await handleOne(file, mode); }
     catch (e) { console.error(e); toast("Could not read that photo.", "err"); }
     finally { processing--; emit(); }
+    // one photo at a time: suggest counting the bag before the next one (batches are counted later on the Parts tab)
+    if (out?.kind === "added" && list.length === 1 && askCountOn()) await countPrompt(out.item, { sameBags: out.sameBags });
   }
 }
 async function handleOne(file, mode) {
@@ -580,7 +603,7 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   const photo = media?.photo, thumb = media?.thumb;
   const r = interpret(codes);
   if (r.boxCode) {
-    if (!boxByCode(r.boxCode)) await write(() => store.set("boxes", r.boxCode, { name: "", location: "", printed: true, createdAt: Date.now(), by: state.me || "" }));
+    if (!boxByCode(r.boxCode)) await write(() => store.set("boxes", r.boxCode, { name: "", location: "", printed: true, createdAt: Date.now(), by: state.me || "", list: listForBoxCode(r.boxCode) }));
     setCurrentBox(r.boxCode);
     if (!r.item && !r.partRef) { if (!opts.live) toast(`Now filling box ${r.boxCode}`, "ok"); return { kind: "box", text: `Now filling ${r.boxCode}` }; }
   }
@@ -644,7 +667,7 @@ async function handleDecoded(codes, media, mode, opts = {}) {
     if (aiOn()) loose = true; // Claude version: let Claude identify it from the photo
     else {
       const id = newId();
-      const ok = await write(() => store.set("items", id, { box: currentBox || "", at: Date.now(), by: state.me || "", raw: "", codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)), source: "manual", needsLabel: true, hasPhoto: !!thumb }));
+      const ok = await write(() => store.set("items", id, { box: currentBox || "", list: itemListNow(), at: Date.now(), by: state.me || "", raw: "", codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)), source: "manual", needsLabel: true, hasPhoto: !!thumb }));
       if (!ok) return;
       if (thumb) savePhoto(id, thumb);
       for (const x of recent) expanded.delete(x);
@@ -657,10 +680,11 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   r.item = found ? merged : null;
   const rawKey = printable(r.primary || "");
   const dupe = rawKey && (r.has2DData || r.known1D) ? state.items.find((i) => printable(i.raw) === rawKey) : null;
-  if (dupe) toast(`Heads up: this exact label was already counted in ${dupe.box || "no box"}.`, "err");
+  const sameBags = rawKey && (r.has2DData || r.known1D) ? state.items.filter((i) => printable(i.raw) === rawKey).length : 0;
+  if (dupe && !opts.live) toast(`Another bag of this part (bag ${sameBags + 1}) — added separately.`, "ok");
   const id = newId();
   let item = {
-    box: currentBox || "", ...(r.item || {}),
+    box: currentBox || "", list: itemListNow(), ...(r.item || {}),
     raw: rawKey, codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)),
     at: Date.now(), by: state.me || "", source: loose ? "photo" : ocrUsed ? "label-text" : "barcode", needsLabel: !r.has2DData && !r.known1D,
   };
@@ -686,7 +710,7 @@ async function handleDecoded(codes, media, mode, opts = {}) {
     if (!item.fromOrder && (fromText.includes("mpn") || fromText.includes("qty") || (fromText.includes("supplierPn") && !item.mpn))) item.needsCheck = true;
     if (r.multi && !item.fromOrder && !item.mpn) item.needsCheck = true;
   }
-  if (!item.category && item.description) item.category = guessCategory(item.description);
+  if (!item.category && item.description) item.category = guessCategory(item.description, item.list);
   const wantAI = !!photo && aiOn() && (!item.description || loose);
   if (wantAI) item.ai = "pending";
   if (loose || (ocrUsed && thumb)) item.hasPhoto = true;
@@ -701,7 +725,65 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   if (!opts.live) toast(label, "ok");
   if (wantAI) queueAI(id, photo, { ...(r.item || {}), ...(item.fromOrder ? { orderHistory: catalogMatch(item) } : {}) }, loose ? "loose" : "bag");
   emit();
-  return { kind: "added", text: label, item };
+  return { kind: "added", text: label, item: { ...item, id }, sameBags };
+}
+
+/* ================= counting (actual quantities) ================= */
+// count = what someone actually counted; qty = what the label says (not verified). countStatus: "counted" | "skipped" | "" (not yet)
+const askCountOn = () => ls.get("askCount", true);
+async function removeItem(id, why) {
+  const it = state.items.find((i) => i.id === id);
+  expanded.delete(id);
+  const i = recent.indexOf(id); if (i >= 0) recent.splice(i, 1);
+  await write(() => store.del("items", id));
+  if (it?.hasPhoto) write(() => store.del("photos", id), true);
+  toast(why || "Removed", "ok");
+}
+async function setCount(id, n) {
+  if (n === 0) return removeItem(id, "Removed — counted 0 (scanned by mistake).");
+  await write(() => store.update("items", id, { count: n, countStatus: "counted", countedBy: state.me || "", countedAt: Date.now() }));
+}
+async function skipCount(id) {
+  await write(() => store.update("items", id, { count: "", countStatus: "skipped", countedBy: state.me || "", countedAt: Date.now() }));
+}
+async function saveCountField(id, v) {
+  const it = state.items.find((i) => i.id === id);
+  if (!it) return;
+  if (v === "") { if (it.count != null && it.count !== "") await write(() => store.update("items", id, { count: "", countStatus: "" })); return; }
+  const n = Math.round(Number(String(v).replace(",", ".")));
+  if (!Number.isFinite(n) || n < 0) return;
+  if (n === 0) { modal("Remove this bag?", "A count of 0 means it was scanned by mistake, so it is removed from the list.", "Delete", () => removeItem(id, "Removed.")); return; }
+  if (it.count === n && it.countStatus === "counted") return;
+  await setCount(id, n);
+}
+// "Count this bag" — shown after a scan. A suggestion: count, say it can't be counted, or do it later.
+function countPrompt(it, opt = {}) {
+  return new Promise((resolve) => {
+    const inp = h("input", { type: "number", inputmode: "numeric", min: "0", class: "countin", placeholder: "How many?", enterkeyhint: "done", "aria-label": "Counted quantity" });
+    const finish = async (fn) => { wrap.remove(); try { await fn(); } finally { resolve(); } };
+    const save = () => {
+      const v = inp.value.trim();
+      if (v === "") { inp.focus(); return; }
+      const n = Math.round(Number(v.replace(",", ".")));
+      if (!Number.isFinite(n) || n < 0) { inp.focus(); return; }
+      finish(async () => { await setCount(it.id, n); if (n > 0) toast(`Counted ${n}`, "ok"); });
+    };
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); save(); } });
+    const wrap = h("div", { class: "modal-wrap count-wrap" },
+      h("div", { class: "modal count" },
+        h("div", { class: "count-title" }, it.description || it.mpn || "This bag"),
+        h("div", { class: "small" }, [it.mpn && it.description ? it.mpn : "", it.box || "no box", opt.sameBags ? `bag ${opt.sameBags + 1} of this part` : ""].filter(Boolean).join(" · ")),
+        h("label", { class: "count-label" }, "How many parts are in this bag?", inp),
+        it.qty != null && it.qty !== "" ? h("button", { class: "btnlink", onclick: () => { inp.value = String(it.qty); inp.focus(); } }, `Label says ${it.qty} (not verified) — use as starting point`) : null,
+        h("div", { class: "small" }, "0 = scanned by mistake (removes this bag)."),
+        h("div", { class: "count-btns" },
+          h("button", { class: "btn primary", onclick: save }, "Save count"),
+          h("button", { class: "btn", onclick: () => finish(async () => { await skipCount(it.id); toast("Marked as can't count", "ok"); }) }, "Can't count"),
+          h("button", { class: "btn ghost", onclick: () => finish(async () => {}) }, "Later"))));
+    document.body.append(wrap);
+    inp.focus();
+    setTimeout(() => { if (document.activeElement !== inp && document.contains(inp)) inp.focus(); }, 60);
+  });
 }
 
 /* ================= live camera scanning (normal web page only) ================= */
@@ -712,7 +794,8 @@ function beep(f = 880) {
   try { navigator.vibrate?.(f < 400 ? [40, 60, 40] : 60); } catch {}
 }
 async function openLive() {
-  if (state.readOnly) return;
+  if (state.readOnly || document.querySelector(".liveov")) return;
+  document.activeElement?.blur?.();
   try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume?.(); } catch {}
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }); }
@@ -730,7 +813,9 @@ async function openLive() {
   updInfo();
   try { await video.play(); } catch {}
   const c = document.createElement("canvas"); const ctx = c.getContext("2d", { willReadFrequently: true });
-  const seenAt = new Map();
+  const lastSeen = new Map(); // code -> last time it was in view; the same label only counts again after it left the view
+  const codeOwner = new Map(); // barcode text -> label it was last seen on
+  let lastLive = null;
   const flash = (text, kind) => { last.textContent = text; last.className = "live-last " + (kind || ""); };
   while (!stop) {
     await new Promise((r) => setTimeout(r, 150));
@@ -747,8 +832,22 @@ async function openLive() {
     if (!codes.length) continue;
     const r = interpret(codes);
     const key = r.boxCode && !r.item ? "box:" + r.boxCode : r.partRef ? "part:" + r.partRef : r.primary;
-    if (!key || (seenAt.get(key) || 0) > Date.now() - 6000) continue;
-    seenAt.set(key, Date.now());
+    if (!key) continue;
+    const now = Date.now();
+    // a frame that only caught some of a label's barcodes (e.g. the stripes on a Mouser label, without its square code)
+    // belongs to the label seen a moment ago, not to a new bag
+    if (!r.boxCode && !r.partRef) {
+      const texts = codes.map((x) => x.text);
+      if (!r.has2DData) {
+        const owners = texts.map((t) => codeOwner.get(t)).filter((o) => o && now - o.at < 6000 && o.key !== key);
+        if (owners.length && owners.length >= Math.ceil(texts.length / 2)) { lastSeen.set(owners[0].key, now); for (const o of owners) o.at = now; continue; }
+      }
+      else for (const t of texts) codeOwner.set(t, { key, at: now }); // a square code with data = a complete label
+    }
+    const prev = lastSeen.get(key);
+    if (window.__LIVE_DEBUG) (window.__keys = window.__keys || []).push([now % 100000, key.slice(0, 40), prev ? now - prev : null]);
+    lastSeen.set(key, now);
+    if (prev && now - prev < 2500) continue; // still the same bag in view
     if (r.boxCode && !r.item && !r.partRef) {
       if (r.boxCode !== currentBox) { await handleDecoded(codes, null, "bag", { live: true }); beep(660); flash(`Now filling ${r.boxCode}`, "box"); updInfo(); }
       continue;
@@ -756,11 +855,10 @@ async function openLive() {
     if (!r.partRef && !r.has2DData && !r.known1D) continue;
     if (r.multi && !(r.multi.fields.mpn && r.multi.fields.qty != null)) {
       const f = r.multi.fields;
-      const done = f.supplierPn && state.items.some((i) => i.supplierPn === f.supplierPn && (!f.lot || i.lot === f.lot) && (!f.dateCode || i.dateCode === f.dateCode));
-      flash(done ? "Already counted — skipped" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the rest…`, done ? "warn" : "box");
-      seenAt.delete(key); continue;
+      const same = lastLive && f.supplierPn && lastLive.supplierPn === f.supplierPn && (!f.lot || lastLive.lot === f.lot);
+      flash(same ? "✓ Done — show the next bag" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the rest…`, same ? "ok" : "box");
+      lastSeen.delete(key); continue;
     }
-    if (!r.partRef && state.items.some((i) => printable(i.raw) === printable(r.primary))) { beep(260); flash("Already counted — skipped", "warn"); continue; }
     let media = null;
     if (!r.has2DData && r.known1D) {
       flash("Hold still — reading label text…", "box");
@@ -769,20 +867,25 @@ async function openLive() {
       media = { ocrCanvas: snap };
     }
     const out = await handleDecoded(codes, media, "bag", { live: true });
-    if (out?.kind === "added") { count++; beep(880); flash("✓ " + out.text, "ok"); }
+    if (out?.kind === "added") {
+      count++; beep(880); flash("✓ " + out.text, "ok"); lastLive = out.item;
+      for (const x of codes) codeOwner.set(x.text, { key, at: Date.now() }); // later partial reads of this label are the same bag
+      if (askCountOn()) { await countPrompt(out.item, { sameBags: out.sameBags }); lastSeen.set(key, Date.now()); flash("Show the next bag", "box"); }
+    }
     else if (out) { beep(500); flash(out.text, out.kind === "err" ? "warn" : "ok"); }
     updInfo();
   }
 }
 async function addFromCatalog(row) {
   const id = newId();
-  const item = { box: currentBox || "", at: Date.now(), by: state.me || "", raw: "", codes: [], source: row ? "order" : "manual", needsLabel: true,
-    ...(row ? { mpn: row.m || "", supplierPn: row.sp || "", supplier: row.s || "", manufacturer: row.mf || "", description: row.d || "", category: guessCategory(row.d), fromOrder: true } : {}) };
+  const list = itemListNow();
+  const item = { box: currentBox || "", list, at: Date.now(), by: state.me || "", raw: "", codes: [], source: row ? "order" : "manual", needsLabel: true,
+    ...(row ? { mpn: row.m || "", supplierPn: row.sp || "", supplier: row.s || "", manufacturer: row.mf || "", description: row.d || "", category: guessCategory(row.d, list), fromOrder: true } : {}) };
   const ok = await write(() => store.set("items", id, item));
   if (!ok) return;
   for (const x of recent) expanded.delete(x);
   recent.unshift(id); expanded.add(id); sessionCount++; sendPresence(); emit();
-  setTimeout(() => $(`[data-id="${id}"] input[name=${row ? "qty" : "description"}]`)?.focus(), 80);
+  setTimeout(() => $(`[data-id="${id}"] input[name=${row ? "count" : "description"}]`)?.focus(), 80);
 }
 function addByHandDialog() {
   if (state.readOnly) return;
@@ -933,44 +1036,75 @@ function buildPartLabelsPDF(items, layoutKey, skip) {
 /* ================= Excel ================= */
 function buildWorkbook() {
   const box = (c) => boxByCode(c) || {};
-  const rows = [...state.items].sort((a, b) => (a.box || "~").localeCompare(b.box || "~") || (a.at || 0) - (b.at || 0)).map((i) => ({
-    Box: i.box || "", "Box name": box(i.box).name || "", Location: box(i.box).location || "", Category: i.category || "", Description: i.description || "",
+  const status = (i) => (i.countStatus === "counted" && i.count !== "" && i.count != null ? "Counted" : i.countStatus === "skipped" ? "Can't count" : "Not counted yet");
+  const rowOf = (i) => ({
+    List: LISTS[listOf(i)].name, Box: i.box || "", "Box name": box(i.box).name || "", Location: box(i.box).location || "", Category: i.category || "", Description: i.description || "",
     Manufacturer: i.manufacturer || "", "Manufacturer PN": i.mpn || "", Supplier: i.supplier || "", "Supplier PN": i.supplierPn || "",
-    Qty: i.qty === "" || i.qty == null ? "" : Number(i.qty), "PO / order": i.po || i.order || "", Invoice: i.invoice || "", Line: i.line || "",
+    "COUNTED QTY (actual)": status(i) === "Counted" ? Number(i.count) : "", "Count status": status(i),
+    "Counted by": i.countedBy && status(i) !== "Not counted yet" ? realName(i.countedBy) : "", "Counted at": i.countedAt && status(i) !== "Not counted yet" ? new Date(i.countedAt).toLocaleString() : "",
+    "Label qty (scanned, NOT verified)": i.qty === "" || i.qty == null ? "" : Number(i.qty),
+    "PO / order": i.po || i.order || "", Invoice: i.invoice || "", Line: i.line || "",
     Lot: i.lot || "", "Date code": i.dateCode || "", "Country of origin": i.coo || "", Serial: i.serial || "", Notes: i.notes || "",
-    "How identified": i.source === "label-text" ? "Barcode + label text (check)" : i.raw ? "Supplier barcode" : i.source === "order" ? "Picked from orders" : i.source === "photo" ? (i.aiConfidence ? `Claude from photo (${i.aiConfidence} confidence)` : "Photo") : "By hand",
-    "Needs check": i.needsCheck ? "yes" : "", "Own label": i.labelPrinted ? PART_PREFIX + i.id : "",
-    "Counted by": realName(i.by), "Counted at": i.at ? new Date(i.at).toLocaleString() : "", "Raw barcode": printable(i.raw),
-  }));
+    "How identified": i.source === "label-text" ? "Codes + label text" : i.raw ? "Supplier code" : i.source === "order" ? "Picked from orders" : i.source === "photo" ? (i.aiConfidence ? `Claude from photo (${i.aiConfidence} confidence)` : "Photo") : "By hand",
+    "Read from": i.readFrom || "", "Needs check": i.needsCheck ? "yes" : "", "Own label": i.labelPrinted ? PART_PREFIX + i.id : "",
+    "Scanned by": realName(i.by), "Scanned at": i.at ? new Date(i.at).toLocaleString() : "", "Raw barcode": printable(i.raw),
+  });
+  const WIDTHS = [18, 6, 18, 16, 16, 36, 16, 20, 10, 18, 12, 15, 14, 16, 14, 12, 12, 6, 10, 9, 8, 22, 24, 18, 30, 8, 18, 14, 16, 40];
+  const sheetOf = (rows) => {
+    const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ List: "" }]);
+    ws["!cols"] = WIDTHS.map((w) => ({ wch: w }));
+    if (rows.length) ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length, c: Object.keys(rows[0]).length - 1 } }) };
+    return ws;
+  };
+  const sorted = [...state.items].sort((a, b) => (a.box || "~").localeCompare(b.box || "~") || (a.at || 0) - (b.at || 0));
   const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Box: "" }]);
-  ws["!cols"] = [6, 18, 16, 14, 36, 16, 20, 10, 20, 7, 12, 12, 6, 10, 9, 8, 22, 24, 22, 8, 18, 14, 16, 40].map((w) => ({ wch: w }));
-  if (rows.length) ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length, c: 23 } }) };
-  XLSX.utils.book_append_sheet(wb, ws, "Inventory");
+  const readme = XLSX.utils.aoa_to_sheet([
+    ["Inventory export", new Date().toLocaleString()],
+    [],
+    ["COUNTED QTY (actual)", "What someone physically counted in that bag. This is the real stock."],
+    ["Count status", "Counted / Can't count (counting not possible) / Not counted yet"],
+    ["Label qty (scanned, NOT verified)", "What the supplier label says. Not checked — do not use as stock."],
+    ["Electrical / Wiring harness", "One sheet per list. 'By part' totals per part, per list."],
+    ["By part → Counted total", "Sum of counted bags only. 'Count complete' says whether every bag of that part was counted."],
+  ]);
+  readme["!cols"] = [{ wch: 34 }, { wch: 90 }];
+  XLSX.utils.book_append_sheet(wb, readme, "Read me");
+  for (const l of ["el", "wh"]) XLSX.utils.book_append_sheet(wb, sheetOf(sorted.filter((i) => listOf(i) === l).map(rowOf)), l === "el" ? "Electrical" : "Wiring harness");
 
   const agg = new Map();
   for (const i of state.items) {
-    const key = U(i.mpn || i.description || i.supplierPn || "(unknown)");
-    const a = agg.get(key) || { "Manufacturer PN": i.mpn || "", Description: i.description || "", Category: i.category || "", Manufacturer: i.manufacturer || "", "Total qty": 0, Bags: 0, Boxes: new Set() };
-    a["Total qty"] += Number(i.qty) || 0; a.Bags++; if (i.box) a.Boxes.add(i.box);
+    const key = listOf(i) + "|" + U(i.mpn || i.description || i.supplierPn || "(unknown)");
+    const a = agg.get(key) || { List: LISTS[listOf(i)].name, "Manufacturer PN": i.mpn || "", Description: i.description || "", Category: i.category || "", Manufacturer: i.manufacturer || "",
+      "COUNTED total (actual)": 0, "Bags counted": 0, "Bags can't count": 0, "Bags not counted yet": 0, Bags: 0, "Count complete": "", "Label qty total (NOT verified)": 0, Boxes: new Set() };
+    const st = status(i);
+    if (st === "Counted") { a["COUNTED total (actual)"] += Number(i.count) || 0; a["Bags counted"]++; }
+    else if (st === "Can't count") a["Bags can't count"]++; else a["Bags not counted yet"]++;
+    a.Bags++; a["Label qty total (NOT verified)"] += Number(i.qty) || 0; if (i.box) a.Boxes.add(i.box);
     if (!a.Description && i.description) a.Description = i.description;
     if (!a.Category && i.category) a.Category = i.category;
     agg.set(key, a);
   }
-  const byPart = [...agg.values()].map((a) => ({ ...a, Boxes: [...a.Boxes].sort().join(", ") }))
-    .sort((a, b) => (a.Category || "~").localeCompare(b.Category || "~") || String(a["Manufacturer PN"]).localeCompare(String(b["Manufacturer PN"])));
-  const ws2 = XLSX.utils.json_to_sheet(byPart.length ? byPart : [{ "Manufacturer PN": "" }]);
-  ws2["!cols"] = [22, 40, 16, 18, 10, 6, 30].map((w) => ({ wch: w }));
+  const byPart = [...agg.values()].map((a) => ({ ...a, "Count complete": a["Bags counted"] === a.Bags ? "yes" : a["Bags counted"] ? "partly" : "no", Boxes: [...a.Boxes].sort().join(", ") }))
+    .sort((a, b) => a.List.localeCompare(b.List) || (a.Category || "~").localeCompare(b.Category || "~") || String(a["Manufacturer PN"]).localeCompare(String(b["Manufacturer PN"])));
+  const ws2 = XLSX.utils.json_to_sheet(byPart.length ? byPart : [{ List: "" }]);
+  ws2["!cols"] = [18, 22, 40, 16, 18, 14, 8, 10, 12, 6, 10, 14, 30].map((w) => ({ wch: w }));
+  if (byPart.length) ws2["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: byPart.length, c: 12 } }) };
   XLSX.utils.book_append_sheet(wb, ws2, "By part");
 
-  const boxes = [...state.boxes].sort((a, b) => a.id.localeCompare(b.id)).map((b) => ({ Box: b.id, Name: b.name || "", Location: b.location || "", Bags: state.items.filter((i) => i.box === b.id).length }));
+  const boxes = [...state.boxes].sort((a, b) => a.id.localeCompare(b.id)).map((b) => {
+    const its = state.items.filter((i) => i.box === b.id);
+    return { List: LISTS[listOf(b)].name, Box: b.id, Name: b.name || "", Location: b.location || "", Bags: its.length, "Bags counted": its.filter((i) => status(i) === "Counted").length };
+  });
   const ws3 = XLSX.utils.json_to_sheet(boxes.length ? boxes : [{ Box: "" }]);
-  ws3["!cols"] = [{ wch: 8 }, { wch: 36 }, { wch: 22 }, { wch: 6 }];
+  ws3["!cols"] = [{ wch: 18 }, { wch: 8 }, { wch: 36 }, { wch: 22 }, { wch: 6 }, { wch: 12 }];
   XLSX.utils.book_append_sheet(wb, ws3, "Boxes");
 
   const people = new Map();
-  for (const i of state.items) people.set(i.by || "", (people.get(i.by || "") || 0) + 1);
-  const ws4 = XLSX.utils.json_to_sheet([...people.entries()].map(([id, n]) => ({ "Counted by": realName(id) || "Unknown", Bags: n })));
+  for (const i of state.items) {
+    const p = people.get(i.by || "") || { s: 0, c: 0 }; p.s++; people.set(i.by || "", p);
+    if (status(i) === "Counted" && i.countedBy != null) { const q = people.get(i.countedBy || "") || { s: 0, c: 0 }; q.c++; people.set(i.countedBy || "", q); }
+  }
+  const ws4 = XLSX.utils.json_to_sheet([...people.entries()].map(([id, p]) => ({ Person: realName(id) || "Unknown", "Bags scanned": p.s, "Bags counted": p.c })));
   XLSX.utils.book_append_sheet(wb, ws4, "Team");
   return XLSX.write(wb, { type: "array", bookType: "xlsx" });
 }
@@ -1021,11 +1155,17 @@ function statusEl() {
 function boxSelect(value, onchange, opts = {}) {
   const sel = h("select", { onchange: (e) => { e.target.blur(); onchange(e.target.value); }, class: opts.class || "", disabled: opts.disabled },
     h("option", { value: "" }, opts.empty || "— no box —"),
-    ...[...state.boxes].sort((a, b) => a.id.localeCompare(b.id)).map((b) => h("option", { value: b.id }, b.id + (b.name ? " · " + b.name : "") + (b.location ? " (" + b.location + ")" : ""))));
+    ...[...state.boxes].filter((b) => listOf(b) === (opts.list || currentList) || b.id === value).sort((a, b) => a.id.localeCompare(b.id)).map((b) => h("option", { value: b.id }, b.id + (b.name ? " · " + b.name : "") + (b.location ? " (" + b.location + ")" : ""))));
   sel.value = value || "";
   return sel;
 }
 function chip(text, cls = "") { return h("span", { class: "tag " + cls }, text); }
+function listSwitch() {
+  const n = (l) => state.items.filter((i) => listOf(i) === l).length;
+  return h("div", { class: "seg", role: "tablist", "aria-label": "Which list" },
+    ...["el", "wh"].map((l) => h("button", { class: currentList === l ? "on" : "", role: "tab", "aria-selected": currentList === l ? "true" : "false", onclick: () => setList(l) },
+      LISTS[l].name, h("span", { class: "n" }, n(l) ? ` ${n(l)}` : ""))));
+}
 
 function photoEl(id) {
   const img = h("img", { class: "photo", alt: "Photo of the part", onerror: () => wrap.remove() });
@@ -1037,8 +1177,11 @@ function photoEl(id) {
 function itemCard(it) {
   const open = expanded.has(it.id);
   const title = it.description || it.mpn || (it.ai === "pending" ? "Claude is identifying…" : "Unnamed part");
-  const sub = [it.mpn && it.description ? it.mpn : "", it.qty != null && it.qty !== "" ? `${it.qty} pcs` : "", it.supplier || "", it.box || "no box"].filter(Boolean).join(" · ");
+  const counted = it.countStatus === "counted" && it.count !== "" && it.count != null;
+  const cnt = counted ? `${it.count} counted` : it.countStatus === "skipped" ? "can't count" : it.qty != null && it.qty !== "" ? `label ${it.qty} · not counted` : "not counted";
+  const sub = [it.mpn && it.description ? it.mpn : "", cnt, it.supplier || "", it.box || "no box"].filter(Boolean).join(" · ");
   const flags = [
+    !counted && it.countStatus !== "skipped" ? chip("count?", "count") : null,
     it.ai === "pending" ? h("span", { class: "dot" }) : null,
     it.needsCheck ? chip("check", "warn") : null,
     it.needsLabel && !it.labelPrinted ? chip("no label") : null,
@@ -1054,15 +1197,25 @@ function itemCard(it) {
     if (field === "qty") v = raw === "" ? "" : Number(raw);
     if ((it[field] ?? "") === v) return;
     const upd = { [field]: v };
-    if (field === "description" && !it.category) { const g = guessCategory(v); if (g) upd.category = g; }
+    if (field === "description" && !it.category) { const g = guessCategory(v, listOf(it)); if (g) upd.category = g; }
+    if (field === "box" && v && boxByCode(v)) upd.list = listOf(boxByCode(v));
     await write(() => store.update("items", it.id, upd));
   };
   const form = h("div", { class: "form" });
-  form.append(h("label", {}, h("span", {}, "Box"), boxSelect(it.box, (v) => save("box", v), { disabled: ro })));
+  const countIn = h("input", bound(it.id + ":count", counted ? it.count : "", (v) => saveCountField(it.id, v), { name: "count", type: "number", inputmode: "numeric", min: "0", placeholder: it.countStatus === "skipped" ? "can't count" : "not counted yet", enterkeyhint: "done", disabled: ro }));
+  form.append(h("div", { class: "countrow wide" },
+    h("label", {}, h("span", {}, "Counted qty (actual)"), countIn),
+    h("div", { class: "countside" },
+      h("span", { class: "small" }, counted ? `by ${nameOf(it.countedBy) || "?"}${it.countedAt ? " · " + fmtTime(it.countedAt) : ""}` : it.countStatus === "skipped" ? "marked as can't count" : "0 removes a mis-scan"),
+      ro ? null : it.countStatus === "skipped"
+        ? h("button", { class: "btnlink", onclick: () => write(() => store.update("items", it.id, { countStatus: "" })) }, "Count it after all")
+        : h("button", { class: "btnlink", onclick: () => skipCount(it.id) }, "Can't count"))));
+  form.append(h("label", {}, h("span", {}, "Box"), boxSelect(it.box, (v) => save("box", v), { disabled: ro, list: listOf(it) })));
   for (const [k, label] of FIELDS) {
     let input;
     if (k === "category") {
-      input = h("select", { name: k, onchange: (e) => { e.target.blur(); save(k, e.target.value); }, disabled: ro }, h("option", { value: "" }, "—"), ...CATEGORIES.map((c) => h("option", { value: c }, c)));
+      const cats = catsFor(listOf(it)), opts2 = it[k] && !cats.includes(it[k]) ? [...cats, it[k]] : cats;
+      input = h("select", { name: k, onchange: (e) => { e.target.blur(); save(k, e.target.value); }, disabled: ro }, h("option", { value: "" }, "—"), ...opts2.map((c) => h("option", { value: c }, c)));
       input.value = it[k] || "";
     } else {
       const live = k === "description" || k === "mpn" ? () => { // keep the card title in step while typing
@@ -1146,6 +1299,7 @@ function viewScan() {
   const ro = state.readOnly;
   const newBoxBtn = h("button", { class: "btnlink", disabled: ro, onclick: async () => { const m = await addBoxes([""]); if (m[0]) { setCurrentBox(m[0]); toast(`New box ${m[0]} — name it below, print its label later`, "ok"); setTimeout(() => $("#boxname")?.focus(), 80); } } }, "+ New box");
   return h("div", {},
+    listSwitch(),
     teamStrip(true),
     h("section", { class: "boxbar" },
       h("div", { class: "row between" }, h("div", { class: "boxbar-label" }, "Filling box"), ro ? null : newBoxBtn),
@@ -1183,7 +1337,9 @@ function viewScan() {
 
 function filteredItems() {
   const qs = search.trim().toLowerCase();
-  let items = state.items.filter((i) => (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
+  let items = state.items.filter((i) => listOf(i) === currentList && (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
+  if (filterFlag === "uncounted") items = items.filter((i) => !(i.countStatus === "counted" && i.count !== "" && i.count != null) && i.countStatus !== "skipped");
+  if (filterFlag === "skipped") items = items.filter((i) => i.countStatus === "skipped");
   if (filterWho) items = items.filter((i) => (filterWho === "__me" ? i.by === state.me : i.by === filterWho));
   if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
   if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
@@ -1193,10 +1349,10 @@ function filteredItems() {
 }
 function itemsBody() {
   const items = filteredItems();
-  const total = items.reduce((s2, i) => s2 + (Number(i.qty) || 0), 0);
-  const unlabelled = items.filter((i) => i.needsLabel && !i.labelPrinted);
+  const countedBags = items.filter((i) => i.countStatus === "counted" && i.count !== "" && i.count != null);
+  const total = countedBags.reduce((s2, i) => s2 + (Number(i.count) || 0), 0);
   return h("div", { id: "itemsbody" },
-    h("div", { class: "row between summary" }, h("span", {}, `${plural(items.length, "bag")} · ${total.toLocaleString()} pcs`),
+    h("div", { class: "row between summary" }, h("span", {}, `${plural(items.length, "bag")} · ${countedBags.length} counted · ${total.toLocaleString()} pcs counted`),
       h("div", { class: "row" },
         h("button", { class: "btn", disabled: !items.length, onclick: async () => { await commitAll(); partLabelDialog(filteredItems(), filteredItems().filter((i) => i.needsLabel && !i.labelPrinted)); } }, "Part labels"),
         h("button", { class: "btn primary", disabled: !state.items.length, onclick: async (e) => { e.target.disabled = true; try { await commitAll(); await saveFile(`inventory-${today()}.xlsx`, new Uint8Array(buildWorkbook())); } finally { e.target.disabled = false; } } }, "Export to Excel"))),
@@ -1206,7 +1362,9 @@ function itemsBody() {
 }
 function viewItems() {
   const qs = search.trim().toLowerCase();
-  let items = state.items.filter((i) => (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
+  let items = state.items.filter((i) => listOf(i) === currentList && (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
+  if (filterFlag === "uncounted") items = items.filter((i) => !(i.countStatus === "counted" && i.count !== "" && i.count != null) && i.countStatus !== "skipped");
+  if (filterFlag === "skipped") items = items.filter((i) => i.countStatus === "skipped");
   if (filterWho) items = items.filter((i) => (filterWho === "__me" ? i.by === state.me : i.by === filterWho));
   if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
   if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
@@ -1220,11 +1378,12 @@ function viewItems() {
   const whoSel = h("select", { onchange: (e) => { e.target.blur(); filterWho = e.target.value; emit(); } }, h("option", { value: "" }, "Everyone"), h("option", { value: "__me" }, "Counted by me"),
     ...people.filter((p) => p !== state.me).map((p) => h("option", { value: p }, realName(p) || "Teammate")));
   whoSel.value = filterWho;
-  const flagSel = h("select", { onchange: (e) => { e.target.blur(); filterFlag = e.target.value; emit(); } }, h("option", { value: "" }, "All parts"), h("option", { value: "check" }, "Needs checking"), h("option", { value: "label" }, "Needs own label"), h("option", { value: "nodesc" }, "No description"));
+  const flagSel = h("select", { onchange: (e) => { e.target.blur(); filterFlag = e.target.value; emit(); } }, h("option", { value: "" }, "All parts"), h("option", { value: "uncounted" }, "Not counted yet"), h("option", { value: "skipped" }, "Can't count"), h("option", { value: "check" }, "Needs checking"), h("option", { value: "label" }, "Needs own label"), h("option", { value: "nodesc" }, "No description"));
   flagSel.value = filterFlag;
   const searchInput = h("input", { type: "search", id: "search", "data-f": "search", placeholder: "Search part, MPN, category…", value: search, enterkeyhint: "search", oninput: (e) => { search = e.target.value; clearTimeout(viewItems.t); viewItems.t = setTimeout(() => { const b = $("#itemsbody"); if (b) b.replaceWith(itemsBody()); }, 200); } });
   const unlabelled = items.filter((i) => i.needsLabel && !i.labelPrinted);
   return h("div", {},
+    listSwitch(),
     h("div", { class: "toolbar" }, searchInput, h("div", { class: "filters" }, boxSel, whoSel, flagSel)),
     itemsBody());
 }
@@ -1250,7 +1409,7 @@ function partLabelDialog(inView, unlabelled) {
 
 const pickedForPrint = new Set(ls.get("picked", []));
 function viewBoxes() {
-  const boxes = [...state.boxes].sort((a, b) => a.id.localeCompare(b.id));
+  const boxes = [...state.boxes].filter((b) => listOf(b) === currentList).sort((a, b) => a.id.localeCompare(b.id));
   const ro = state.readOnly;
   const nameIn = h("input", { type: "text", "data-f": "newbox", placeholder: "e.g. Resistors 0603, Connectors…", autocomplete: "off" });
   const countIn = h("input", { type: "number", "data-f": "count", min: "1", max: "100", value: "10", inputmode: "numeric", class: "num" });
@@ -1260,6 +1419,7 @@ function viewBoxes() {
   const toPrint = boxes.filter((b) => pickedForPrint.has(b.id));
   const savePick = () => ls.set("picked", [...pickedForPrint]);
   return h("div", {},
+    listSwitch(),
     ro ? null : h("section", { class: "panel" },
       h("h2", {}, "Add boxes"),
       h("div", { class: "row" }, nameIn, h("button", { class: "btn primary", onclick: async () => {
@@ -1362,6 +1522,11 @@ function viewSetup() {
   const orderIn = h("input", { type: "file", accept: ".csv,.xlsx,.xls,.tsv,text/csv", class: "hidden", multiple: true, onchange: async (e) => { const f = [...e.target.files]; e.target.value = ""; for (const x of f) await importOrderFile(x); } });
   if (state.mode === "join") return viewJoin();
   return h("div", {},
+    h("section", { class: "panel" },
+      h("h2", {}, "Counting"),
+      h("label", { class: "toggle" }, h("input", { type: "checkbox", checked: askCountOn(), onchange: (e) => { ls.set("askCount", e.target.checked); emit(); } }),
+        h("span", {}, "After each scan, ask how many parts are in the bag (you can always choose “Can't count” or “Later”).")),
+      h("p", { class: "small" }, "The label quantity is never treated as stock. Only counted bags add up to the counted total. Find bags still to count with the “Not counted yet” filter on the Parts tab.")),
     state.mode === "sheet" ? sheetPanel() : null,
     !INCLAUDE && state.mode === "local" ? connectPanel() : null,
     h("section", { class: "panel" },
@@ -1427,7 +1592,7 @@ async function saveItemField(id, field, raw) {
   if (field === "qty") { v = raw === "" ? "" : Number(String(raw).replace(",", ".")); if (Number.isNaN(v)) return; }
   if ((it[field] ?? "") === v) return;
   const upd = { [field]: v };
-  if (field === "description" && !it.category) { const g = guessCategory(v); if (g) upd.category = g; }
+  if (field === "description" && !it.category) { const g = guessCategory(v, listOf(it)); if (g) upd.category = g; }
   await write(() => store.update("items", id, upd));
 }
 async function saveBoxField(id, field, v) {
@@ -1445,7 +1610,7 @@ function render() {
   render.pending = false;
   let keep = null;
   if (a && a.closest?.("#view") && a.dataset?.f) { keep = { f: a.dataset.f, v: a.value, s: null, e: null }; try { keep.s = a.selectionStart; keep.e = a.selectionEnd; } catch {} }
-  const counts = { scan: "", items: state.items.length || "", boxes: state.boxes.length || "", setup: "" };
+  const counts = { scan: "", items: state.items.filter((i) => listOf(i) === currentList).length || "", boxes: state.boxes.filter((b) => listOf(b) === currentList).length || "", setup: "" };
   for (const t of TABS) { const b = $(`#tab-${t}`); b.classList.toggle("on", tab === t); b.querySelector(".n").textContent = counts[t] ? " " + counts[t] : ""; }
   const others = teamNow().filter((p) => !p.isMe).length;
   $("#tab-setup .n").textContent = others ? ` ●${others + 1}` : "";

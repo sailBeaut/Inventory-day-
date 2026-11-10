@@ -8,12 +8,12 @@ const TEAM_CODE = 'change-me';
 
 const T = {
   Items: ['id', 'box', 'category', 'description', 'manufacturer', 'mpn', 'supplier', 'supplierPn', 'qty', 'notes', 'po', 'invoice', 'line', 'lot', 'dateCode', 'coo', 'serial', 'order',
-    'source', 'needsCheck', 'needsLabel', 'labelPrinted', 'hasPhoto', 'fromOrder', 'ai', 'aiConfidence', 'aiSeen', 'by', 'at', 'updatedAt', 'deleted', 'raw', 'codes', 'readFrom'], // new columns only ever go at the end
-  Boxes: ['id', 'name', 'location', 'printed', 'hasPhoto', 'by', 'createdAt', 'updatedAt', 'deleted'],
+    'source', 'needsCheck', 'needsLabel', 'labelPrinted', 'hasPhoto', 'fromOrder', 'ai', 'aiConfidence', 'aiSeen', 'by', 'at', 'updatedAt', 'deleted', 'raw', 'codes', 'readFrom', 'count', 'countStatus', 'countedBy', 'countedAt', 'list'], // new columns only ever go at the end
+  Boxes: ['id', 'name', 'location', 'printed', 'hasPhoto', 'by', 'createdAt', 'updatedAt', 'deleted', 'list'],
   Orders: ['imp', 'file', 'supplier', 'at', 'by', 's', 'sp', 'm', 'mf', 'd', 'q'],
   Photos: ['id', 'data', 'at'],
 };
-const NUMERIC = { qty: 1, q: 1 };
+const NUMERIC = { qty: 1, q: 1, count: 1 };
 
 function doGet() {
   return json({ ok: true, app: 'inventory-day', note: 'This is the backend. Paste this URL into the inventory page.' });

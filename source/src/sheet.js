@@ -1,6 +1,6 @@
 // Shared store backed by a Google Sheet (Apps Script web app). No Claude account needed.
 const BOOL = ["needsCheck", "needsLabel", "labelPrinted", "hasPhoto", "fromOrder", "printed", "deleted"];
-const NUM = ["qty", "at", "updatedAt", "createdAt"];
+const NUM = ["qty", "at", "updatedAt", "createdAt", "count", "countedAt"];
 const TABLE = { items: "items", boxes: "boxes" };
 
 function lsGet(k, d) { try { const v = localStorage.getItem("inv:" + k); return v == null ? d : JSON.parse(v); } catch { return d; } }
