@@ -843,6 +843,17 @@ async function handleDecoded(codes, media, mode, opts = {}) {
 /* ================= counting (actual quantities) ================= */
 // count = what someone actually counted; qty = what the label says (not verified). countStatus: "counted" | "skipped" | "" (not yet)
 const askCountOn = () => ls.get("askCount", true);
+// Counts entered before this moment are not reliable (lost or unchecked); only later counts are real stock.
+// Earlier counts are kept and shown separately ("earlier count, NOT reliable"); those bags count as not counted yet.
+const COUNT_CUTOFF = Date.UTC(2026, 10, 10, 15, 10); // 10 Nov 2026, 16:10 Amsterdam
+const COUNT_CUTOFF_TXT = "10 Nov 16:10";
+const freshCount = (i) => Number(i.countedAt || 0) >= COUNT_CUTOFF;
+// "counted" | "skipped" | "" — only counts from after the cutoff
+const cState = (i) => (!freshCount(i) ? "" : i.countStatus === "counted" && i.count !== "" && i.count != null ? "counted" : i.countStatus === "skipped" ? "skipped" : "");
+const isCounted = (i) => cState(i) === "counted";
+const isSkipped = (i) => cState(i) === "skipped";
+// the earlier, unreliable count of a bag (number), or null
+const oldCount = (i) => (!freshCount(i) && i.count !== "" && i.count != null && Number.isFinite(Number(i.count)) ? Number(i.count) : null);
 async function removeItem(id, why) {
   const it = state.items.find((i) => i.id === id);
   expanded.delete(id);
@@ -861,11 +872,11 @@ async function skipCount(id) {
 async function saveCountField(id, v) {
   const it = state.items.find((i) => i.id === id);
   if (!it) return;
-  if (v === "") { if (it.count != null && it.count !== "") await write(() => store.update("items", id, { count: "", countStatus: "" })); return; }
+  if (v === "") { if (isCounted(it)) await write(() => store.update("items", id, { count: "", countStatus: "" })); return; }
   const n = Math.round(Number(String(v).replace(",", ".")));
   if (!Number.isFinite(n) || n < 0) return;
   if (n === 0) { modal("Remove this bag?", "A count of 0 means it was scanned by mistake, so it is removed from the list.", "Delete", () => removeItem(id, "Removed.")); return; }
-  if (it.count === n && it.countStatus === "counted") return;
+  if (it.count === n && isCounted(it)) return;
   await setCount(id, n);
 }
 // "Count this bag" — shown after a scan. A suggestion: count, say it can't be counted, or do it later.
@@ -1154,20 +1165,22 @@ function buildPartLabelsPDF(items, layoutKey, skip) {
 /* ================= Excel ================= */
 function buildWorkbook() {
   const box = (c) => boxByCode(c) || {};
-  const status = (i) => (i.countStatus === "counted" && i.count !== "" && i.count != null ? "Counted" : i.countStatus === "skipped" ? "Can't count" : "Not counted yet");
+  const status = (i) => (isCounted(i) ? "Counted" : isSkipped(i) ? "Can't count" : "Not counted yet");
+  const OLD = `Earlier count (before ${COUNT_CUTOFF_TXT}, NOT reliable)`;
   const rowOf = (i) => ({
     List: LISTS[listOf(i)].name, Box: i.box || "", "Box name": box(i.box).name || "", Location: box(i.box).location || "", Category: i.category || "", Description: i.description || "",
     Manufacturer: i.manufacturer || "", "Manufacturer PN": i.mpn || "", Supplier: i.supplier || "", "Supplier PN": i.supplierPn || "",
     "COUNTED QTY (actual)": status(i) === "Counted" ? Number(i.count) : "", "Count status": status(i),
     "Counted by": i.countedBy && status(i) !== "Not counted yet" ? realName(i.countedBy) : "", "Counted at": i.countedAt && status(i) !== "Not counted yet" ? new Date(i.countedAt).toLocaleString() : "",
     "Label qty (scanned, NOT verified)": i.qty === "" || i.qty == null ? "" : Number(i.qty),
+    [OLD]: oldCount(i) ?? "",
     "PO / order": i.po || i.order || "", Invoice: i.invoice || "", Line: i.line || "",
     Lot: i.lot || "", "Date code": i.dateCode || "", "Country of origin": i.coo || "", Serial: i.serial || "", Notes: i.notes || "",
     "How identified": i.source === "label-text" ? "Codes + label text" : i.raw ? "Supplier code" : i.source === "order" ? "Picked from orders" : i.source === "photo" ? (i.aiConfidence ? `Claude from photo (${i.aiConfidence} confidence)` : "Photo") : "By hand",
     "Read from": i.readFrom || "", "Needs check": i.needsCheck ? "yes" : "", "Own label": i.labelPrinted ? PART_PREFIX + i.id : "",
     "Scanned by": realName(i.by), "Scanned at": i.at ? new Date(i.at).toLocaleString() : "", "Raw barcode": printable(i.raw),
   });
-  const WIDTHS = [18, 6, 18, 16, 16, 36, 16, 20, 10, 18, 12, 15, 14, 16, 14, 12, 12, 6, 10, 9, 8, 22, 24, 18, 30, 8, 18, 14, 16, 40];
+  const WIDTHS = [18, 6, 18, 16, 16, 36, 16, 20, 10, 18, 12, 15, 14, 16, 14, 16, 12, 12, 6, 10, 9, 8, 22, 24, 18, 30, 8, 18, 14, 16, 40];
   const sheetOf = (rows) => {
     const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ List: "" }]);
     ws["!cols"] = WIDTHS.map((w) => ({ wch: w }));
@@ -1182,6 +1195,7 @@ function buildWorkbook() {
     ["COUNTED QTY (actual)", "What someone physically counted in that bag. This is the real stock."],
     ["Count status", "Counted / Can't count (counting not possible) / Not counted yet"],
     ["Label qty (scanned, NOT verified)", "What the supplier label says. Not checked — do not use as stock."],
+    [`Earlier count (before ${COUNT_CUTOFF_TXT})`, `Counts typed in before ${COUNT_CUTOFF_TXT} on 10 Nov 2026. NOT reliable — not included in the counted quantities; those bags show as 'Not counted yet' until recounted.`],
     ["Electrical / Wiring harness", "One sheet per list. 'By part' totals per part, per list."],
     ["By part → Counted total", "Sum of counted bags only. 'Count complete' says whether every bag of that part was counted."],
   ]);
@@ -1193,11 +1207,11 @@ function buildWorkbook() {
   for (const i of state.items) {
     const key = listOf(i) + "|" + U(i.mpn || i.description || i.supplierPn || "(unknown)");
     const a = agg.get(key) || { List: LISTS[listOf(i)].name, "Manufacturer PN": i.mpn || "", Description: i.description || "", Category: i.category || "", Manufacturer: i.manufacturer || "",
-      "COUNTED total (actual)": 0, "Bags counted": 0, "Bags can't count": 0, "Bags not counted yet": 0, Bags: 0, "Count complete": "", "Label qty total (NOT verified)": 0, Boxes: new Set() };
+      "COUNTED total (actual)": 0, "Bags counted": 0, "Bags can't count": 0, "Bags not counted yet": 0, Bags: 0, "Count complete": "", "Label qty total (NOT verified)": 0, [`Earlier counts total (before ${COUNT_CUTOFF_TXT}, NOT reliable)`]: 0, Boxes: new Set() };
     const st = status(i);
     if (st === "Counted") { a["COUNTED total (actual)"] += Number(i.count) || 0; a["Bags counted"]++; }
     else if (st === "Can't count") a["Bags can't count"]++; else a["Bags not counted yet"]++;
-    a.Bags++; a["Label qty total (NOT verified)"] += Number(i.qty) || 0; if (i.box) a.Boxes.add(i.box);
+    a.Bags++; a["Label qty total (NOT verified)"] += Number(i.qty) || 0; a[`Earlier counts total (before ${COUNT_CUTOFF_TXT}, NOT reliable)`] += oldCount(i) || 0; if (i.box) a.Boxes.add(i.box);
     if (!a.Description && i.description) a.Description = i.description;
     if (!a.Category && i.category) a.Category = i.category;
     agg.set(key, a);
@@ -1205,8 +1219,8 @@ function buildWorkbook() {
   const byPart = [...agg.values()].map((a) => ({ ...a, "Count complete": a["Bags counted"] === a.Bags ? "yes" : a["Bags counted"] ? "partly" : "no", Boxes: [...a.Boxes].sort().join(", ") }))
     .sort((a, b) => a.List.localeCompare(b.List) || (a.Category || "~").localeCompare(b.Category || "~") || String(a["Manufacturer PN"]).localeCompare(String(b["Manufacturer PN"])));
   const ws2 = XLSX.utils.json_to_sheet(byPart.length ? byPart : [{ List: "" }]);
-  ws2["!cols"] = [18, 22, 40, 16, 18, 14, 8, 10, 12, 6, 10, 14, 30].map((w) => ({ wch: w }));
-  if (byPart.length) ws2["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: byPart.length, c: 12 } }) };
+  ws2["!cols"] = [18, 22, 40, 16, 18, 14, 8, 10, 12, 6, 10, 14, 18, 30].map((w) => ({ wch: w }));
+  if (byPart.length) ws2["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: byPart.length, c: 13 } }) };
   XLSX.utils.book_append_sheet(wb, ws2, "By part");
 
   const boxes = [...state.boxes].sort((a, b) => a.id.localeCompare(b.id)).map((b) => {
@@ -1296,11 +1310,11 @@ function photoEl(id) {
 function itemCard(it) {
   const open = expanded.has(it.id);
   const title = it.description || it.mpn || (it.ai === "pending" ? "Claude is identifying…" : "Unnamed part");
-  const counted = it.countStatus === "counted" && it.count !== "" && it.count != null;
-  const cnt = counted ? `${it.count} counted` : it.countStatus === "skipped" ? "can't count" : it.qty != null && it.qty !== "" ? `label ${it.qty} · not counted` : "not counted";
+  const counted = isCounted(it), skipped = isSkipped(it), old = oldCount(it);
+  const cnt = counted ? `${it.count} counted` : skipped ? "can't count" : [it.qty != null && it.qty !== "" ? `label ${it.qty}` : "", old != null ? `earlier ${old} (unreliable)` : "", "not counted"].filter(Boolean).join(" · ");
   const sub = [it.mpn && it.description ? it.mpn : "", cnt, it.supplier || "", it.box || "no box"].filter(Boolean).join(" · ");
   const flags = [
-    !counted && it.countStatus !== "skipped" ? chip("count?", "count") : null,
+    !counted && !skipped ? chip(old != null ? "recount" : "count?", "count") : null,
     it.ai === "pending" ? h("span", { class: "dot" }) : null,
     it.needsCheck ? chip("check", "warn") : null,
     it.needsLabel && !it.labelPrinted ? chip("no label") : null,
@@ -1321,12 +1335,12 @@ function itemCard(it) {
     await write(() => store.update("items", it.id, upd));
   };
   const form = h("div", { class: "form" });
-  const countIn = h("input", bound(it.id + ":count", counted ? it.count : "", (v) => saveCountField(it.id, v), { name: "count", type: "number", inputmode: "numeric", min: "0", placeholder: it.countStatus === "skipped" ? "can't count" : "not counted yet", enterkeyhint: "done", disabled: ro }));
+  const countIn = h("input", bound(it.id + ":count", counted ? it.count : "", (v) => saveCountField(it.id, v), { name: "count", type: "number", inputmode: "numeric", min: "0", placeholder: skipped ? "can't count" : old != null ? `earlier ${old} — recount` : "not counted yet", enterkeyhint: "done", disabled: ro }));
   form.append(h("div", { class: "countrow wide" },
     h("label", {}, h("span", {}, "Counted qty (actual)"), countIn),
     h("div", { class: "countside" },
-      h("span", { class: "small" }, counted ? `by ${nameOf(it.countedBy) || "?"}${it.countedAt ? " · " + fmtTime(it.countedAt) : ""}` : it.countStatus === "skipped" ? "marked as can't count" : "0 removes a mis-scan"),
-      ro ? null : it.countStatus === "skipped"
+      h("span", { class: "small" }, counted ? `by ${nameOf(it.countedBy) || "?"}${it.countedAt ? " · " + fmtTime(it.countedAt) : ""}` : skipped ? "marked as can't count" : old != null ? `Earlier count ${old} (before ${COUNT_CUTOFF_TXT}) is not reliable — count again. 0 removes a mis-scan` : "0 removes a mis-scan"),
+      ro ? null : skipped
         ? h("button", { class: "btnlink", onclick: () => write(() => store.update("items", it.id, { countStatus: "" })) }, "Count it after all")
         : h("button", { class: "btnlink", onclick: () => skipCount(it.id) }, "Can't count"))));
   form.append(h("label", {}, h("span", {}, "Box"), boxSelect(it.box, (v) => save("box", v), { disabled: ro, list: listOf(it) })));
@@ -1457,8 +1471,8 @@ function viewScan() {
 function filteredItems() {
   const qs = search.trim().toLowerCase();
   let items = state.items.filter((i) => listOf(i) === currentList && (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
-  if (filterFlag === "uncounted") items = items.filter((i) => !(i.countStatus === "counted" && i.count !== "" && i.count != null) && i.countStatus !== "skipped");
-  if (filterFlag === "skipped") items = items.filter((i) => i.countStatus === "skipped");
+  if (filterFlag === "uncounted") items = items.filter((i) => !isCounted(i) && !isSkipped(i));
+  if (filterFlag === "skipped") items = items.filter(isSkipped);
   if (filterWho) items = items.filter((i) => (filterWho === "__me" ? i.by === state.me : i.by === filterWho));
   if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
   if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
@@ -1468,7 +1482,7 @@ function filteredItems() {
 }
 function itemsBody() {
   const items = filteredItems();
-  const countedBags = items.filter((i) => i.countStatus === "counted" && i.count !== "" && i.count != null);
+  const countedBags = items.filter(isCounted);
   const total = countedBags.reduce((s2, i) => s2 + (Number(i.count) || 0), 0);
   return h("div", { id: "itemsbody" },
     h("div", { class: "row between summary" }, h("span", {}, `${plural(items.length, "bag")} · ${countedBags.length} counted · ${total.toLocaleString()} pcs counted`),
@@ -1482,8 +1496,8 @@ function itemsBody() {
 function viewItems() {
   const qs = search.trim().toLowerCase();
   let items = state.items.filter((i) => listOf(i) === currentList && (!filterBox || (filterBox === "__none" ? !i.box : i.box === filterBox)));
-  if (filterFlag === "uncounted") items = items.filter((i) => !(i.countStatus === "counted" && i.count !== "" && i.count != null) && i.countStatus !== "skipped");
-  if (filterFlag === "skipped") items = items.filter((i) => i.countStatus === "skipped");
+  if (filterFlag === "uncounted") items = items.filter((i) => !isCounted(i) && !isSkipped(i));
+  if (filterFlag === "skipped") items = items.filter(isSkipped);
   if (filterWho) items = items.filter((i) => (filterWho === "__me" ? i.by === state.me : i.by === filterWho));
   if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
   if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
