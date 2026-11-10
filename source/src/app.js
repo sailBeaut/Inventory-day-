@@ -45,7 +45,7 @@ const U = (s) => String(s || "").trim().toUpperCase();
 // barcode types that appear on part and bag labels (leaving out exotic ones that cause false reads, e.g. DX film edge)
 const LABEL_FORMATS = ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128", "Code39", "Code93", "Codabar", "ITF", "EAN-13", "EAN-8", "UPC-A", "UPC-E", "DataBar", "DataBarExpanded"];
 const is2DFormat = (f) => /DataMatrix|QR|PDF417|Aztec|MaxiCode/.test(f || "");
-const FIELD_LABEL = { mpn: "MPN", qty: "qty", supplierPn: "supplier PN", description: "description", manufacturer: "manufacturer", lot: "lot", dateCode: "date code", line: "line", po: "PO", order: "order" };
+const FIELD_LABEL = { mpn: "MPN", qty: "qty", supplierPn: "supplier PN", description: "description", manufacturer: "manufacturer", lot: "lot", dateCode: "date code", line: "line", po: "PO", order: "order", coo: "country" };
 const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 function fileInput(opts, onFiles) {
   return h("input", { type: "file", accept: "image/*", class: "hidden", ...opts, onchange: (e) => { const f = [...e.target.files]; e.target.value = ""; if (f.length) onFiles(f); } });
@@ -395,7 +395,7 @@ function enhance(c) {
 }
 // Read the printed label around its barcodes. Straightens it using the barcodes' angle and returns: the text, the caption
 // printed above each barcode (-> which field that barcode is), the value printed after each caption, and text-only fields.
-async function readLabel(src, codes) {
+async function readLabel(src, codes, opt = {}) {
   ocrBusy++; emit();
   try {
     const w = await getOcr();
@@ -446,7 +446,7 @@ async function readLabel(src, codes) {
     const { data } = await w.recognize(page.cv);
     let text = data?.text || "";
     const captions = codes.map(() => null), stripText = [];
-    if (!single) {
+    if (!single && opt.strips !== false) {
       // one clean line per barcode: its caption (and printed value) sits just above the stripes
       const SP = { top: 0.105, bot: 0.033, width: 1400, psm: 7, ...(window.__STRIP || {}) };
       await psm(SP.psm);
@@ -592,60 +592,84 @@ async function handleDecoded(codes, media, mode, opts = {}) {
     toast(it.box === currentBox || !currentBox ? `Found: ${it.description || it.mpn || "part"} (${it.box || "no box"})` : `Found in ${it.box || "no box"} — tap “Move to ${currentBox}” if it lives here now`, "ok");
     emit(); return { kind: "found", text: `Found: ${it.description || it.mpn || "part"} (${it.box || "no box"})` };
   }
-  // Barcodes without a 2D supplier code (Farnell etc.), or no barcode at all: read the printed label too, then decide per field
-  // which source to trust. A barcode value always wins over text (barcodes are checksummed); text fills what has no barcode.
-  let ocrUsed = false, readFrom = null;
-  if (mode !== "loose" && !r.has2D && ocrAvailable() && media?.ocrCanvas) {
+  // ===== Priority: 1) QR / square code  2) stripe barcodes  3) printed text (RS labels, descriptions)  4) manual entry =====
+  // Each step only fills fields the steps before it left empty.
+  const same = (a, b) => String(a).replace(/[^A-Z0-9]/gi, "").toUpperCase() === String(b).replace(/[^A-Z0-9]/gi, "").toUpperCase();
+  const merged = {}, src = {};
+  const put = (fields, how) => {
+    for (const [k, v] of Object.entries(fields || {})) {
+      if (v == null || v === "" || (typeof v === "number" && Number.isNaN(v))) continue;
+      if (merged[k] == null || merged[k] === "") { merged[k] = v; src[k] = how; }
+      else if (how === "text" && same(merged[k], v) && !src[k].includes("+")) src[k] += " + text";
+    }
+  };
+  put(r.fields2D, "QR code");
+  put(r.fields1D, "barcode");
+  let ocrUsed = false;
+  const needText = () => !merged.mpn || merged.qty == null || (!opts.live && !merged.description);
+  if (mode !== "loose" && ocrAvailable() && media?.ocrCanvas && needText()) {
     const oneD = (r.all || []).filter((c) => !is2DFormat(c.format));
     const plain = oneD.filter((c) => !parseFarnellBarcode(c.text));
     try {
-      const L = await readLabel(media.ocrCanvas, oneD);
-      const capOf = new Map(oneD.map((c, i) => [c, L.captions[i]]));
-      const fromCodes = {}, src = {};
-      for (const [k, v] of Object.entries(r.item || {})) { fromCodes[k] = v; src[k] = "barcode"; }
-      if (plain.length >= 2 || (plain.length === 1 && capOf.get(plain[0]))) {
-        const res = resolveBarcodes(plain, plain.map((c) => capOf.get(c)));
-        for (const k of Object.keys(fromCodes)) if (r.multi && k in r.multi.fields) { delete fromCodes[k]; delete src[k]; }
-        for (const [k, v] of Object.entries(res.fields)) { fromCodes[k] = v; src[k] = "barcode"; }
-        r.captionsSeen = Object.values(res.src).includes("caption");
+      const L = await readLabel(media.ocrCanvas, oneD, { strips: !r.has2DData });
+      if (!r.has2DData) {
+        const capOf = new Map(oneD.map((c, i) => [c, L.captions[i]]));
+        if (plain.length >= 2 || (plain.length === 1 && capOf.get(plain[0]))) {
+          const res = resolveBarcodes(plain, plain.map((c) => capOf.get(c)));
+          // the printed captions say which barcode is which: they replace the layout guesses
+          for (const k of Object.keys(r.multi?.fields || {})) if (src[k] === "barcode") { delete merged[k]; delete src[k]; }
+          put(res.fields, "barcode");
+          r.captionsSeen = Object.values(res.src).includes("caption");
+        }
       }
-      // printed values: "Caption: value" lines first, then the old Farnell layout, then text-only fields
       const t = { ...L.extra, ...parseLabelText(L.text), ...L.values };
-      const same = (a, b) => String(a).replace(/[^A-Z0-9]/gi, "").toUpperCase() === String(b).replace(/[^A-Z0-9]/gi, "").toUpperCase();
-      const merged = { ...fromCodes };
-      for (const [k, v] of Object.entries(t)) {
-        if (v == null || v === "") continue;
-        if (merged[k] == null || merged[k] === "") { merged[k] = k === "qty" ? Number(v) : v; src[k] = "text"; }
-        else if (src[k] === "barcode" && same(merged[k], v)) src[k] = "barcode+text";
-      }
-      if (Object.keys(merged).length) {
-        r.item = merged;
-        if (!r.item.supplier && /^\d{7}$/.test(r.item.supplierPn || "") && (r.item.mpn || r.item.order)) r.item.supplier = "Farnell";
-        ocrUsed = Object.values(src).includes("text") || !!r.captionsSeen;
-        readFrom = src;
-        if (!r.primary || r.primary.startsWith("L|")) r.primary = ["L", merged.supplierPn, merged.mpn, merged.lot, merged.dateCode, merged.qty].map((x) => x ?? "").join("|");
-      }
-    } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — barcodes still used.", "err"); }
+      if (t.qty != null) t.qty = Number(t.qty);
+      put(t, "text");
+      ocrUsed = Object.values(src).some((v) => v.includes("text")) || !!r.captionsSeen;
+    } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — using the barcodes only.", "err"); }
   }
-  const loose = mode === "loose" || !r.item;
-  if (!r.item && !aiOn() && mode !== "loose") {
-    toast("No barcode found — use “Unmarked part” to save it with a photo.", "err"); return;
+  if (!merged.supplier && /^\d{7}$/.test(merged.supplierPn || "") && (merged.mpn || merged.order)) { merged.supplier = "Farnell"; src.supplier = src.supplierPn; }
+  if (Object.keys(merged).length && (!r.primary || r.primary.startsWith("L|") || (!r.has2DData && !r.known1D)))
+    r.primary = ["L", merged.supplierPn, merged.mpn, merged.lot, merged.dateCode, merged.qty].map((x) => x ?? "").join("|");
+  const readFrom = Object.keys(src).length ? src : null;
+  // a read from codes always counts; text alone must give at least two part fields (a stray word on the bag is not a part)
+  const fromCode = Object.values(src).some((v) => /QR|barcode/.test(v));
+  const textHits = ["mpn", "supplierPn", "qty", "description"].filter((k) => merged[k] != null && merged[k] !== "").length;
+  const found = fromCode ? !!(merged.mpn || merged.supplierPn || merged.description || merged.order) : textHits >= 2;
+
+  // 4) nothing readable: manual entry (photo kept so it can be typed from it later)
+  let loose = mode === "loose";
+  if (!found && !loose) {
+    if (opts.live) return null;
+    if (aiOn()) loose = true; // Claude version: let Claude identify it from the photo
+    else {
+      const id = newId();
+      const ok = await write(() => store.set("items", id, { box: currentBox || "", at: Date.now(), by: state.me || "", raw: "", codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)), source: "manual", needsLabel: true, hasPhoto: !!thumb }));
+      if (!ok) return;
+      if (thumb) savePhoto(id, thumb);
+      for (const x of recent) expanded.delete(x);
+      recent.unshift(id); expanded.add(id); sessionCount++; sendPresence(); emit();
+      toast("Couldn't read this label — type the part in (the photo is saved with it).", "err");
+      setTimeout(() => $(`[data-id="${id}"] input[name=description]`)?.focus(), 120);
+      return { kind: "manual", text: "Couldn't read it — type it in" };
+    }
   }
+  r.item = found ? merged : null;
   const rawKey = printable(r.primary || "");
-  const dupe = rawKey && r.has2D ? state.items.find((i) => printable(i.raw) === rawKey) : null;
+  const dupe = rawKey && (r.has2DData || r.known1D) ? state.items.find((i) => printable(i.raw) === rawKey) : null;
   if (dupe) toast(`Heads up: this exact label was already counted in ${dupe.box || "no box"}.`, "err");
   const id = newId();
   let item = {
     box: currentBox || "", ...(r.item || {}),
     raw: rawKey, codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)),
-    at: Date.now(), by: state.me || "", source: loose ? "photo" : ocrUsed ? "label-text" : "barcode", needsLabel: !r.has2D && !r.known1D,
+    at: Date.now(), by: state.me || "", source: loose ? "photo" : ocrUsed ? "label-text" : "barcode", needsLabel: !r.has2DData && !r.known1D,
   };
   if (ocrUsed && item.supplierPn) {
     // the supplier order code is short and digits-only, so it reads reliably — trust your order history over the OCR'd text
     const row = catalog.bySpn.get(U(item.supplierPn));
     if (row) {
       for (const [k, rk] of [["mpn", "m"], ["description", "d"], ["manufacturer", "mf"], ["supplier", "s"]]) {
-        if (!row[rk] || String(readFrom?.[k] || "").startsWith("barcode")) continue; // never replace a barcode-read value
+        if (!row[rk] || /QR|barcode/.test(String(readFrom?.[k] || ""))) continue; // never replace a value read from a code
         item[k] = row[rk]; if (readFrom) readFrom[k] = "order history";
       }
       item.fromOrder = true;
@@ -655,9 +679,13 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   if (readFrom) {
     const fromText = Object.entries(readFrom).filter(([, v]) => v === "text").map(([k]) => k);
     if (Number.isNaN(item.qty)) delete item.qty;
-    item.readFrom = Object.entries(readFrom).filter(([k]) => FIELD_LABEL[k]).map(([k, v]) => `${FIELD_LABEL[k]}: ${v}`).join(", ");
+    // e.g. "QR code: MPN, qty · barcode: supplier PN · text: description"
+    const groups = {};
+    for (const [k, v] of Object.entries(readFrom)) if (FIELD_LABEL[k]) (groups[v] = groups[v] || []).push(FIELD_LABEL[k]);
+    item.readFrom = Object.entries(groups).map(([how, ks]) => `${how}: ${ks.join(", ")}`).join(" · ");
     if (!item.fromOrder && (fromText.includes("mpn") || fromText.includes("qty") || (fromText.includes("supplierPn") && !item.mpn))) item.needsCheck = true;
-  } else if (r.multi && !item.fromOrder && !r.multi.fields.mpn) item.needsCheck = true;
+    if (r.multi && !item.fromOrder && !item.mpn) item.needsCheck = true;
+  }
   if (!item.category && item.description) item.category = guessCategory(item.description);
   const wantAI = !!photo && aiOn() && (!item.description || loose);
   if (wantAI) item.ai = "pending";
@@ -725,7 +753,7 @@ async function openLive() {
       if (r.boxCode !== currentBox) { await handleDecoded(codes, null, "bag", { live: true }); beep(660); flash(`Now filling ${r.boxCode}`, "box"); updInfo(); }
       continue;
     }
-    if (!r.partRef && !r.has2D && !r.known1D) continue;
+    if (!r.partRef && !r.has2DData && !r.known1D) continue;
     if (r.multi && !(r.multi.fields.mpn && r.multi.fields.qty != null)) {
       const f = r.multi.fields;
       const done = f.supplierPn && state.items.some((i) => i.supplierPn === f.supplierPn && (!f.lot || i.lot === f.lot) && (!f.dateCode || i.dateCode === f.dateCode));
@@ -734,7 +762,7 @@ async function openLive() {
     }
     if (!r.partRef && state.items.some((i) => printable(i.raw) === printable(r.primary))) { beep(260); flash("Already counted — skipped", "warn"); continue; }
     let media = null;
-    if (!r.has2D && r.known1D) {
+    if (!r.has2DData && r.known1D) {
       flash("Hold still — reading label text…", "box");
       const snap = document.createElement("canvas"); snap.width = video.videoWidth; snap.height = video.videoHeight;
       snap.getContext("2d").drawImage(video, 0, 0);
@@ -1037,7 +1065,11 @@ function itemCard(it) {
       input = h("select", { name: k, onchange: (e) => { e.target.blur(); save(k, e.target.value); }, disabled: ro }, h("option", { value: "" }, "—"), ...CATEGORIES.map((c) => h("option", { value: c }, c)));
       input.value = it[k] || "";
     } else {
-      input = h("input", bound(it.id + ":" + k, it[k], (v) => saveItemField(it.id, k, v), { name: k, type: k === "qty" ? "number" : "text", inputmode: k === "qty" ? "numeric" : null, autocomplete: "off", enterkeyhint: "done", disabled: ro }));
+      const live = k === "description" || k === "mpn" ? () => { // keep the card title in step while typing
+        const d = card.querySelector('input[name="description"]')?.value.trim(), m = card.querySelector('input[name="mpn"]')?.value.trim();
+        const t = card.querySelector(".card-title .t"); if (t) t.textContent = d || m || "Unnamed part";
+      } : null;
+      input = h("input", bound(it.id + ":" + k, it[k], (v) => saveItemField(it.id, k, v), { name: k, type: k === "qty" ? "number" : "text", inputmode: k === "qty" ? "numeric" : null, autocomplete: "off", enterkeyhint: "done", disabled: ro, oninput: live }));
     }
     form.append(h("label", { class: k === "description" || k === "notes" ? "wide" : "" }, h("span", {}, label), input));
   }
@@ -1373,7 +1405,7 @@ function bound(key, current, saveFn, extra = {}) {
   draftSavers.set(key, saveFn);
   return {
     ...extra, "data-f": key, value: drafts.has(key) ? drafts.get(key) : current ?? "",
-    oninput: (e) => { drafts.set(key, e.target.value); clearTimeout(draftTimers.get(key)); draftTimers.set(key, setTimeout(() => commitDraft(key), 800)); },
+    oninput: (e) => { drafts.set(key, e.target.value); clearTimeout(draftTimers.get(key)); draftTimers.set(key, setTimeout(() => commitDraft(key), 800)); extra.oninput?.(e); },
     onchange: () => commitDraft(key),
     onblur: () => commitDraft(key),
   };

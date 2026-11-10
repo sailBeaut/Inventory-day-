@@ -2,6 +2,7 @@
 
 A phone web page for counting electronics and PCB components. No account needed.
 
+- Reading order for every scan: 1) QR / square code (DataMatrix, QR) → 2) stripe barcodes → 3) printed text → 4) manual entry with the photo attached. Each step only fills fields the earlier ones left empty, and each part records what came from where.
 - Scan supplier barcodes (Mouser, DigiKey, LCSC, TME and other ECIA DataMatrix/QR codes) by live camera or photo.
 - Labels with plain barcodes (Farnell / element14 old and new style, and similar): every barcode is decoded, the caption printed above each one (in English, Dutch, German or French) says which field it is, and the printed text fills in what has no barcode (description, manufacturer). Per field, a barcode value always beats text, because barcodes have a built-in check and text reading doesn't. Text reading is Tesseract.js OCR, downloaded once from jsDelivr. Imported order history fixes any text that was misread. Each part records where every field was read from.
 - RS Components labels: stock number (e.g. 205-1899), part number and country of origin are read from the printed text when the barcode can't be decoded.

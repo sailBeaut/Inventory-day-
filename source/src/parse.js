@@ -114,9 +114,9 @@ export function parseLabelText(raw) {
   if (!it.mpn) {
     for (const l of lines) {
       const t = l.replace(/\s+/g, "");
-      if (l.split(" ").length > 2 || t.length < 5 || t.length > 32) continue;
+      if (l.split(" ").length > 2 || t.length < 6 || t.length > 32) continue;
       if (!/^[A-Z0-9][A-Z0-9\-\/.#+_]+$/i.test(t) || /^(\d{3,4}-\d{3,4}|\d+)$/.test(t)) continue;
-      if ((t.match(/\d/g) || []).length >= 1 && (t.match(/[A-Z]/gi) || []).length >= 2 && !/^(rohs|reach|madein)/i.test(t)) { it.mpn = t.toUpperCase(); break; }
+      if ((t.match(/\d/g) || []).length >= 2 && (t.match(/[A-Z]/gi) || []).length >= 2 && !/^(rohs|reach|madein)/i.test(t)) { it.mpn = t.toUpperCase(); break; }
     }
   }
   const made = /made\s*(?:in|ln|1n|\\n|\|n)?\s+([A-Za-z]{3,}(?: [A-Za-z]{3,})?)/i.exec(text);
@@ -140,40 +140,41 @@ export function interpret(codes) {
   }
   if (!partCodes.length) return { boxCode, partRef, item: null, primary: "", has2D: false };
 
-  let item = {};
-  let primary = "";
+  // 1) QR / square codes (DataMatrix, QR …) with supplier data
   const twoD = partCodes.filter((c) => is2D(c.format));
+  let f2 = {}, p2 = "";
   for (const c of twoD) {
     const e = parseECIA(c.text);
     const parsed = e ? eciaToItem(e) : parseLCSC(c.text) || parseTME(c.text);
-    if (parsed && Object.keys(parsed).length) {
-      item = { ...parsed, ...item };
-      if (!primary) primary = c.text;
-    }
+    if (parsed && Object.keys(parsed).length) { f2 = { ...parsed, ...f2 }; if (!p2) p2 = c.text; }
   }
+  const has2DData = Object.keys(f2).length > 0;
+  // 2) stripe barcodes
   const oneD = partCodes.filter((c) => !is2D(c.format)).map((c) => c.text);
-  let known1D = false, multi = null;
+  let f1 = {}, p1 = "", known1D = false, multi = null;
   for (const t of oneD) {
     const f = parseFarnellBarcode(t);
-    if (f) { item = { ...f, ...item }; known1D = true; if (!primary && !twoD.length) primary = t; }
+    if (f) { f1 = { ...f, ...f1 }; known1D = true; if (!p1) p1 = t; }
   }
-  // several plain barcodes and no 2D supplier code: work out which barcode is which field from the layout
+  // several plain barcodes (no square code with data): work out which barcode is which field from the layout
   const oneDCodes = partCodes.filter((c) => !is2D(c.format) && !parseFarnellBarcode(c.text));
-  if (!Object.keys(item).length && oneDCodes.length >= 2) {
+  if (!has2DData && !known1D && oneDCodes.length >= 2) {
     multi = resolveBarcodes(oneDCodes);
     if (multi.fields.mpn || multi.fields.supplierPn) {
-      item = { ...multi.fields };
+      f1 = { ...multi.fields };
       known1D = true;
-      primary = ["L", item.supplierPn, item.mpn, item.lot, item.dateCode, item.qty].map((x) => x ?? "").join("|");
+      p1 = ["L", f1.supplierPn, f1.mpn, f1.lot, f1.dateCode, f1.qty].map((x) => x ?? "").join("|");
     }
   }
   // Mouser part number appears as 1D like "710-150060RS86000"
-  if (item.mpn && !item.supplierPn) {
-    const sp = oneD.find((t) => /^\d{2,4}-/.test(t) && t.toUpperCase().endsWith(item.mpn.toUpperCase().slice(-6)));
-    if (sp) { item.supplierPn = sp; if (!item.supplier) item.supplier = "Mouser"; }
+  const mp = f2.mpn || f1.mpn;
+  if (mp && !f2.supplierPn && !f1.supplierPn) {
+    const sp = oneD.find((t) => /^\d{2,4}-/.test(t) && t.toUpperCase().endsWith(mp.toUpperCase().slice(-6)));
+    if (sp) { f1.supplierPn = sp; if (!f2.supplier) f1.supplier = "Mouser"; }
   }
-  if (!primary) primary = twoD[0]?.text || oneD.join(" | ");
-  return { boxCode, partRef, item, primary, has2D: twoD.length > 0, known1D, multi, oneD, all: partCodes };
+  const item = { ...f1, ...f2 }; // the square code wins over stripes
+  const primary = p2 || p1 || twoD[0]?.text || oneD.join(" | ");
+  return { boxCode, partRef, item: Object.keys(item).length ? item : null, fields2D: f2, fields1D: f1, primary, has2D: twoD.length > 0, has2DData, known1D, multi, oneD, all: partCodes };
 }
 
 export function printable(t) {
@@ -263,6 +264,7 @@ const CAPTION_WORDS = [
   ["luid", ["luid", "lu-id"]],
   ["supplierPn", ["onderdeelnr", "onderdeel", "partno", "part", "bestellnr", "bestellnummer", "ordercode", "stockno"]],
   ["line", ["artikelnr", "artikel", "line", "lineitem", "item", "pos", "position"]],
+  ["description", ["beschr", "beschrijving", "omschrijving", "description", "bezeichnung", "desc"]],
 ];
 function editDistance(a, b) {
   const m = a.length, n = b.length, d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
@@ -335,11 +337,14 @@ export function captionValues(text) {
   const out = {};
   for (const raw of String(text || "").split(/\n/)) {
     const l = raw.replace(/\s+/g, " ").trim();
-    const m = /^(.{3,40}?)\s*[:;.]\s*([A-Za-z0-9][A-Za-z0-9 .\-\/+#]*)$/.exec(l);
-    if (!m) continue;
+    const ci = Math.max(l.lastIndexOf(":"), l.lastIndexOf(";"));
+    const m = ci >= 3 && ci <= 45 ? [l, l.slice(0, ci), l.slice(ci + 1).trim()] : /^(.{3,40}?)\.\s*([A-Za-z0-9].*)$/.exec(l);
+    if (!m || !/^[A-Za-z0-9]/.test(m[2] || "")) continue;
     const f = classifyCaption(m[1]);
     if (!f || f in out || f === "luid" || f === "custPn") continue;
     let v = m[2].trim();
+    if (f === "description") { if ((v.match(/[A-Za-z]/g) || []).length >= 4) out.description = v.slice(0, 160); continue; }
+    if (!/^[A-Za-z0-9][A-Za-z0-9 .\-\/+#]*$/.test(v)) continue;
     if (f === "qty") { const n = /^\d[\d.,]*/.exec(v.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1")); if (!n) continue; v = n[0].replace(/[.,]/g, ""); }
     else if (["mpn", "lot", "supplierPn", "dateCode", "line"].includes(f)) v = v.split(" ")[0].toUpperCase();
     if (v) out[f] = v;
