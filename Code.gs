@@ -8,7 +8,7 @@ const TEAM_CODE = 'change-me';
 
 const T = {
   Items: ['id', 'box', 'category', 'description', 'manufacturer', 'mpn', 'supplier', 'supplierPn', 'qty', 'notes', 'po', 'invoice', 'line', 'lot', 'dateCode', 'coo', 'serial', 'order',
-    'source', 'needsCheck', 'needsLabel', 'labelPrinted', 'hasPhoto', 'fromOrder', 'ai', 'aiConfidence', 'aiSeen', 'by', 'at', 'updatedAt', 'deleted', 'raw', 'codes'],
+    'source', 'needsCheck', 'needsLabel', 'labelPrinted', 'hasPhoto', 'fromOrder', 'ai', 'aiConfidence', 'aiSeen', 'by', 'at', 'updatedAt', 'deleted', 'raw', 'codes', 'readFrom'], // new columns only ever go at the end
   Boxes: ['id', 'name', 'location', 'printed', 'hasPhoto', 'by', 'createdAt', 'updatedAt', 'deleted'],
   Orders: ['imp', 'file', 'supplier', 'at', 'by', 's', 'sp', 'm', 'mf', 'd', 'q'],
   Photos: ['id', 'data', 'at'],
@@ -58,6 +58,14 @@ function sheet(name) {
     cols.forEach((c, i) => { if (NUMERIC[c]) sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat('General'); });
     const extra = ss.getSheetByName('Sheet1') || ss.getSheetByName('Blad1');
     if (extra && extra.getLastRow() === 0 && ss.getSheets().length > 1) ss.deleteSheet(extra);
+  } else {
+    // sheet made by an older version of this script: add any new header columns (always appended at the end)
+    const cols = T[name], have = sh.getRange(1, 1, 1, cols.length).getValues()[0];
+    if (String(have[cols.length - 1]) !== cols[cols.length - 1]) {
+      sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+      sh.getRange(1, 1, sh.getMaxRows(), cols.length).setNumberFormat('@');
+      cols.forEach((c, i) => { if (NUMERIC[c]) sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat('General'); });
+    }
   }
   return sh;
 }

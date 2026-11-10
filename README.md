@@ -3,7 +3,7 @@
 A phone web page for counting electronics and PCB components. No account needed.
 
 - Scan supplier barcodes (Mouser, DigiKey, LCSC, TME and other ECIA DataMatrix/QR codes) by live camera or photo.
-- Farnell / element14 bag labels: the barcode gives the order and line; the printed text (order code, MPN, description, qty) is read on the phone with OCR (Tesseract.js, downloaded once from jsDelivr). Imported Farnell order history corrects any misread characters.
+- Labels with plain barcodes (Farnell / element14 old and new style, and similar): every barcode is decoded, the caption printed above each one (in English, Dutch, German or French) says which field it is, and the printed text fills in what has no barcode (description, manufacturer). Per field, a barcode value always beats text, because barcodes have a built-in check and text reading doesn't. Text reading is Tesseract.js OCR, downloaded once from jsDelivr. Imported order history fixes any text that was misread. Each part records where every field was read from.
 - Print QR labels for boxes and for unmarked parts.
 - Import order history from Mouser, DigiKey, LCSC, TME or Farnell to fill in part descriptions.
 - Several people can count at once. A Google Sheet holds the shared list (`Code.gs` is its Apps Script backend).

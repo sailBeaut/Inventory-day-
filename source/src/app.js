@@ -3,7 +3,7 @@ import wasmBin from "../node_modules/zxing-wasm/dist/reader/zxing_reader.wasm";
 import { jsPDF } from "jspdf";
 import qrcode from "qrcode-generator";
 import * as XLSX from "xlsx";
-import { interpret, printable, BOX_PREFIX, PART_PREFIX, parseOrderRows, guessCategory, parseLabelText } from "./parse.js";
+import { interpret, printable, BOX_PREFIX, PART_PREFIX, parseOrderRows, guessCategory, parseLabelText, resolveBarcodes, classifyCaption, parseFarnellBarcode, captionValues } from "./parse.js";
 import { sheetStore } from "./sheet.js";
 import SCRIPT_SOURCE from "./Code.gs";
 
@@ -42,6 +42,8 @@ const today = () => new Date().toISOString().slice(0, 10);
 const fmtTime = (ms) => new Date(ms).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const U = (s) => String(s || "").trim().toUpperCase();
+const is2DFormat = (f) => /DataMatrix|QR|PDF417|Aztec|MaxiCode/.test(f || "");
+const FIELD_LABEL = { mpn: "MPN", qty: "qty", supplierPn: "supplier PN", description: "description", manufacturer: "manufacturer", lot: "lot", dateCode: "date code", line: "line", po: "PO", order: "order" };
 const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 function fileInput(opts, onFiles) {
   return h("input", { type: "file", accept: "image/*", class: "hidden", ...opts, onchange: (e) => { const f = [...e.target.files]; e.target.value = ""; if (f.length) onFiles(f); } });
@@ -351,7 +353,7 @@ async function decodeFile(file, { decode = true } = {}) {
 function relPos(p, w, h) {
   if (!p?.topLeft) return null;
   const f = (q) => ({ x: q.x / w, y: q.y / h });
-  return { tl: f(p.topLeft), tr: f(p.topRight), bl: f(p.bottomLeft), br: f(p.bottomRight) };
+  return { tl: f(p.topLeft), tr: f(p.topRight), bl: f(p.bottomLeft), br: f(p.bottomRight), ar: w / h };
 }
 
 /* ================= on-device text reading (OCR) — normal web page only ================= */
@@ -375,39 +377,9 @@ function getOcr() {
   }
   return ocrWorkerP;
 }
-// Crop around a 1D barcode (rotated upright), or use the whole photo
-function ocrCrop(src, code) {
-  const W = src.width, H = src.height, p = code?.pos;
-  if (!p) return toCanvas(src, 2000);
-  const tl = { x: p.tl.x * W, y: p.tl.y * H }, tr = { x: p.tr.x * W, y: p.tr.y * H }, bl = { x: p.bl.x * W, y: p.bl.y * H }, br = { x: p.br.x * W, y: p.br.y * H };
-  const bw = Math.hypot(tr.x - tl.x, tr.y - tl.y);
-  if (bw < 40) return toCanvas(src, 2000);
-  const ang = Math.atan2(tr.y - tl.y, tr.x - tl.x);
-  const cx = (tl.x + tr.x + bl.x + br.x) / 4, cy = (tl.y + tr.y + bl.y + br.y) / 4;
-  const bh = Math.hypot(bl.x - tl.x, bl.y - tl.y) || 0.05 * bw;
-  const g = window.__OCR_GEOM || {};
-  const uL = (g.uL ?? 0.7) * bw, uR = (g.uR ?? 1.5) * bw, vT = (g.vT ?? 0.45) * bw, vB = (g.vB ?? 0.7) * bw;
-  const s = Math.min(3, (g.w ?? 2400) / (uL + uR));
-  const sx = g.sx ?? 1.35; // widen condensed label fonts
-  const c = document.createElement("canvas");
-  c.width = Math.round((uL + uR) * s * sx); c.height = Math.round((vT + vB) * s);
-  const ctx = c.getContext("2d");
-  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
-  ctx.translate(uL * s * sx, vT * s); ctx.scale(s * sx, s); ctx.rotate(-ang); ctx.translate(-cx, -cy);
-  ctx.drawImage(src, 0, 0);
-  // blank out the barcode stripes so they aren't read as text (work in the barcode's own frame)
-  ctx.translate(cx, cy); ctx.rotate(ang); ctx.rotate(-ang);
-  ctx.fillStyle = "#fff";
-  const hb = (g.hb ?? 0.072) * bw;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.translate(uL * s * sx, vT * s); ctx.scale(s * sx, s);
-  ctx.fillRect(-bw / 2 - 0.02 * bw, -hb, bw * 1.04, hb * 2);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  enhance(c);
-  return c;
-}
 // grayscale + contrast stretch (helps faded thermal labels and glare)
 function enhance(c) {
+  if (window.__NOENH) return;
   const ctx = c.getContext("2d", { willReadFrequently: true });
   const im = ctx.getImageData(0, 0, c.width, c.height), d = im.data;
   const hist = new Uint32Array(256);
@@ -419,18 +391,103 @@ function enhance(c) {
   for (let i = 0; i < d.length; i += 4) { let v = ((d[i] - lo) * 255) / span; v = v < 0 ? 0 : v > 255 ? 255 : v; d[i] = d[i + 1] = d[i + 2] = v; }
   ctx.putImageData(im, 0, 0);
 }
-async function readLabelText(src, code) {
+// Read the printed label around its barcodes. Straightens it using the barcodes' angle and returns: the text, the caption
+// printed above each barcode (-> which field that barcode is), the value printed after each caption, and text-only fields.
+async function readLabel(src, codes) {
   ocrBusy++; emit();
   try {
     const w = await getOcr();
-    const crop = ocrCrop(src, code);
-    let { data } = await w.recognize(crop);
-    let fields = parseLabelText(data?.text || "");
-    if (window.__OCR_DEBUG) { window.__crop = crop.toDataURL("image/png"); window.__cropText = data?.text; window.__ocrSrc = src; window.__ocrCode = code; window.__ocrRun = async (psm) => { if (psm) await w.setParameters({ tessedit_pageseg_mode: String(psm) }); const cc = ocrCrop(src, code); window.__crop = cc.toDataURL("image/png"); return (await w.recognize(cc)).data.text; }; }
-    if (code?.pos && !fields.mpn && !fields.qty) { ({ data } = await w.recognize(toCanvas(src, 2000))); fields = parseLabelText(data?.text || ""); }
-    window.__lastOcr = data?.text;
-    return fields;
+    const psm = (m) => w.setParameters({ tessedit_pageseg_mode: String(m) });
+    const W = src.width, H = src.height;
+    const withPos = codes.filter((c) => c.pos);
+    if (!withPos.length) {
+      const full = toCanvas(src, 2000); enhance(full);
+      await psm(11);
+      const { data } = await w.recognize(full);
+      if (window.__OCR_DEBUG) { window.__crop = full.toDataURL("image/png"); window.__cropText = data?.text; }
+      return { text: data?.text || "", captions: [], values: captionValues(data?.text), extra: textExtras(data?.text || "", []) };
+    }
+    const pts = (c) => ["tl", "tr", "br", "bl"].map((k) => ({ x: c.pos[k].x * W, y: c.pos[k].y * H }));
+    const wid = (c) => { const [a, b] = pts(c); return Math.hypot(b.x - a.x, b.y - a.y); };
+    const big = withPos.reduce((m, c) => (wid(c) > wid(m) ? c : m));
+    const [ta, tb] = pts(big), n = Math.hypot(tb.x - ta.x, tb.y - ta.y) || 1;
+    const u = { x: (tb.x - ta.x) / n, y: (tb.y - ta.y) / n }, v = { x: -u.y, y: u.x };
+    const geo = codes.map((c) => {
+      if (!c.pos) return null;
+      const P = pts(c).map((p) => ({ a: p.x * u.x + p.y * u.y, b: p.x * v.x + p.y * v.y }));
+      return { a0: Math.min(...P.map((p) => p.a)), a1: Math.max(...P.map((p) => p.a)), b: P.reduce((s2, p) => s2 + p.b, 0) / 4 };
+    });
+    const G = geo.filter(Boolean), maxW = Math.max(...G.map((g) => g.a1 - g.a0));
+    const single = G.length === 1;
+    const condensed = codes.some((c) => parseFarnellBarcode(c.text)); // old Farnell labels: tall, narrow font
+    // render any rectangle of the label (in label coordinates) upright onto a canvas
+    const render = (A0, A1, B0, B1, width, sx = 1) => {
+      const sc = Math.min(3, width / (A1 - A0));
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(8, Math.round((A1 - A0) * sc * sx)); cv.height = Math.max(8, Math.round((B1 - B0) * sc));
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.setTransform(sc * sx * u.x, sc * v.x, sc * sx * u.y, sc * v.y, -A0 * sc * sx, -B0 * sc);
+      ctx.drawImage(src, 0, 0);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      return { cv, X: (a) => (a - A0) * sc * sx, Y: (b) => (b - B0) * sc, sc };
+    };
+    const A0 = Math.min(...G.map((g) => g.a0)) - 0.2 * maxW, A1 = Math.max(...G.map((g) => g.a1)) + (single ? 1.0 : 0.75) * maxW;
+    const B0 = Math.min(...G.map((g) => g.b)) - 0.45 * maxW, B1 = Math.max(...G.map((g) => g.b)) + (single ? 0.7 : 0.25) * maxW;
+    const page = render(A0, A1, B0, B1, 2400, condensed ? 1.35 : 1);
+    if (single && condensed) { // blank out the stripes so they aren't read as text
+      const g = G[0], hb = 0.072 * maxW, ctx = page.cv.getContext("2d");
+      ctx.fillStyle = "#fff"; ctx.fillRect(page.X(g.a0 - 0.02 * maxW), page.Y(g.b - hb), (g.a1 - g.a0 + 0.04 * maxW) * page.sc * 1.35, 2 * hb * page.sc);
+    }
+    enhance(page.cv);
+    await psm(single ? 6 : 11);
+    const { data } = await w.recognize(page.cv);
+    let text = data?.text || "";
+    const captions = codes.map(() => null), stripText = [];
+    if (!single) {
+      // one clean line per barcode: its caption (and printed value) sits just above the stripes
+      const SP = { top: 0.105, bot: 0.033, width: 1400, psm: 7, ...(window.__STRIP || {}) };
+      await psm(SP.psm);
+      if (window.__OCR_DEBUG) window.__strips = [];
+      for (let i = 0; i < codes.length; i++) {
+        const g = geo[i]; if (!g) continue;
+        const strip = render(g.a0 - 0.05 * maxW, g.a0 + Math.max(g.a1 - g.a0, 0.8 * maxW), g.b - SP.top * maxW, g.b - SP.bot * maxW, SP.width);
+        enhance(strip.cv);
+        const t = ((await w.recognize(strip.cv)).data?.text || "").trim();
+        if (window.__OCR_DEBUG) (window.__strips = window.__strips || []).push(strip.cv.toDataURL("image/png"));
+        stripText[i] = t;
+        captions[i] = classifyCaption(t.split(/[:;]/)[0]);
+      }
+      text = stripText.filter(Boolean).join("\n") + "\n" + text;
+    }
+    const extra = textExtras(text, []);
+    // description: the plain text line just below the supplier part-number barcode (new-style labels)
+    const sp = captions.indexOf("supplierPn");
+    if (sp >= 0 && geo[sp]) {
+      const g = geo[sp];
+      const strip = render(g.a0 - 0.05 * maxW, g.a0 + 1.1 * maxW, g.b + 0.035 * maxW, g.b + 0.11 * maxW, 1600);
+      enhance(strip.cv);
+      const t = ((await w.recognize(strip.cv)).data?.text || "").replace(/\s+/g, " ").trim();
+      if ((t.match(/[A-Za-z]/g) || []).length >= 4 && !classifyCaption(t.split(":")[0])) extra.description = t.replace(/\s*,\s*/g, ", ").slice(0, 160);
+    }
+    if (window.__OCR_DEBUG) { window.__crop = page.cv.toDataURL("image/png"); window.__cropText = text; window.__captions = codes.map((c, i) => [c.text, captions[i], stripText[i] || ""]); }
+    return { text, captions, values: captionValues(text), extra };
   } finally { ocrBusy--; emit(); }
+}
+function textExtras(txt, _lines) {
+  const extra = {};
+  if (/farnell|element ?14|newark/i.test(txt)) extra.supplier = "Farnell";
+  else if (/mouser/i.test(txt)) extra.supplier = "Mouser";
+  else if (/digi-?key/i.test(txt)) extra.supplier = "DigiKey";
+  else if (/\bRS\b.*(components|stock)|rs-online/i.test(txt)) extra.supplier = "RS";
+  const ls2 = txt.split(/\n/).map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+  for (let i = 0; i < ls2.length; i++) {
+    const m = /(?:^|\s)(fabrikant|manufacturer|hersteller|fabricant)\s*:?\s*([A-Za-z][A-Za-z0-9 &.\-]{1,30})?$/i.exec(ls2[i]);
+    if (!m || /nr|part|no\b/i.test(ls2[i].slice(0, m.index + 1))) continue;
+    const val = (m[2] || ls2[i + 1] || "").trim();
+    if (/^[A-Za-z][A-Za-z0-9 &.\-]{1,30}$/.test(val) && !classifyCaption(val)) { extra.manufacturer = val; break; }
+  }
+  return extra;
 }
 function dataUrlToBlob(u) {
   const [head, b64] = u.split(","); const bin = atob(b64); const a = new Uint8Array(bin.length);
@@ -533,19 +590,40 @@ async function handleDecoded(codes, media, mode, opts = {}) {
     toast(it.box === currentBox || !currentBox ? `Found: ${it.description || it.mpn || "part"} (${it.box || "no box"})` : `Found in ${it.box || "no box"} — tap “Move to ${currentBox}” if it lives here now`, "ok");
     emit(); return { kind: "found", text: `Found: ${it.description || it.mpn || "part"} (${it.box || "no box"})` };
   }
-  // Barcode without part data (Farnell etc.) or no barcode at all: read the printed text on the phone
-  let ocrUsed = false;
-  if (mode !== "loose" && !r.has2D && media?.ocrCanvas && ocrAvailable()) {
-    const code1D = (r.all || []).find((c) => c.pos && /^LG\d/.test(String(c.text).trim())) || (r.all || []).find((c) => c.pos);
+  // Barcodes without a 2D supplier code (Farnell etc.), or no barcode at all: read the printed label too, then decide per field
+  // which source to trust. A barcode value always wins over text (barcodes are checksummed); text fills what has no barcode.
+  let ocrUsed = false, readFrom = null;
+  if (mode !== "loose" && !r.has2D && ocrAvailable() && media?.ocrCanvas) {
+    const oneD = (r.all || []).filter((c) => !is2DFormat(c.format));
+    const plain = oneD.filter((c) => !parseFarnellBarcode(c.text));
     try {
-      const f = await readLabelText(media.ocrCanvas, code1D);
-      if (f.mpn || f.qty || f.supplierPn) {
-        r.item = { ...f, ...(r.item || {}) };
-        if (!r.item.supplier && f.supplierPn && /^\d{7}$/.test(f.supplierPn) && f.mpn) r.item.supplier = "Farnell";
-        ocrUsed = true;
-        if (!r.primary) r.primary = [f.supplierPn, f.mpn, f.qty].filter(Boolean).join("|");
+      const L = await readLabel(media.ocrCanvas, oneD);
+      const capOf = new Map(oneD.map((c, i) => [c, L.captions[i]]));
+      const fromCodes = {}, src = {};
+      for (const [k, v] of Object.entries(r.item || {})) { fromCodes[k] = v; src[k] = "barcode"; }
+      if (plain.length >= 2 || (plain.length === 1 && capOf.get(plain[0]))) {
+        const res = resolveBarcodes(plain, plain.map((c) => capOf.get(c)));
+        for (const k of Object.keys(fromCodes)) if (r.multi && k in r.multi.fields) { delete fromCodes[k]; delete src[k]; }
+        for (const [k, v] of Object.entries(res.fields)) { fromCodes[k] = v; src[k] = "barcode"; }
+        r.captionsSeen = Object.values(res.src).includes("caption");
       }
-    } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — check the internet connection.", "err"); }
+      // printed values: "Caption: value" lines first, then the old Farnell layout, then text-only fields
+      const t = { ...L.extra, ...parseLabelText(L.text), ...L.values };
+      const same = (a, b) => String(a).replace(/[^A-Z0-9]/gi, "").toUpperCase() === String(b).replace(/[^A-Z0-9]/gi, "").toUpperCase();
+      const merged = { ...fromCodes };
+      for (const [k, v] of Object.entries(t)) {
+        if (v == null || v === "") continue;
+        if (merged[k] == null || merged[k] === "") { merged[k] = k === "qty" ? Number(v) : v; src[k] = "text"; }
+        else if (src[k] === "barcode" && same(merged[k], v)) src[k] = "barcode+text";
+      }
+      if (Object.keys(merged).length) {
+        r.item = merged;
+        if (!r.item.supplier && /^\d{7}$/.test(r.item.supplierPn || "") && (r.item.mpn || r.item.order)) r.item.supplier = "Farnell";
+        ocrUsed = Object.values(src).includes("text") || !!r.captionsSeen;
+        readFrom = src;
+        if (!r.primary || r.primary.startsWith("L|")) r.primary = ["L", merged.supplierPn, merged.mpn, merged.lot, merged.dateCode, merged.qty].map((x) => x ?? "").join("|");
+      }
+    } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — barcodes still used.", "err"); }
   }
   const loose = mode === "loose" || !r.item;
   if (!r.item && !aiOn() && mode !== "loose") {
@@ -558,15 +636,26 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   let item = {
     box: currentBox || "", ...(r.item || {}),
     raw: rawKey, codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)),
-    at: Date.now(), by: state.me || "", source: loose ? "photo" : ocrUsed ? "label-text" : "barcode", needsLabel: !r.has2D,
+    at: Date.now(), by: state.me || "", source: loose ? "photo" : ocrUsed ? "label-text" : "barcode", needsLabel: !r.has2D && !r.known1D,
   };
   if (ocrUsed && item.supplierPn) {
     // the supplier order code is short and digits-only, so it reads reliably — trust your order history over the OCR'd text
     const row = catalog.bySpn.get(U(item.supplierPn));
-    if (row) { for (const [k, rk] of [["mpn", "m"], ["description", "d"], ["manufacturer", "mf"], ["supplier", "s"]]) if (row[rk]) item[k] = row[rk]; item.fromOrder = true; }
+    if (row) {
+      for (const [k, rk] of [["mpn", "m"], ["description", "d"], ["manufacturer", "mf"], ["supplier", "s"]]) {
+        if (!row[rk] || String(readFrom?.[k] || "").startsWith("barcode")) continue; // never replace a barcode-read value
+        item[k] = row[rk]; if (readFrom) readFrom[k] = "order history";
+      }
+      item.fromOrder = true;
+    }
   }
   item = fillFromCatalog(item);
-  if (ocrUsed && !item.fromOrder) item.needsCheck = true;
+  if (readFrom) {
+    const fromText = Object.entries(readFrom).filter(([, v]) => v === "text").map(([k]) => k);
+    if (Number.isNaN(item.qty)) delete item.qty;
+    item.readFrom = Object.entries(readFrom).filter(([k]) => FIELD_LABEL[k]).map(([k, v]) => `${FIELD_LABEL[k]}: ${v}`).join(", ");
+    if (!item.fromOrder && (fromText.includes("mpn") || fromText.includes("qty") || (fromText.includes("supplierPn") && !item.mpn))) item.needsCheck = true;
+  } else if (r.multi && !item.fromOrder && !r.multi.fields.mpn) item.needsCheck = true;
   if (!item.category && item.description) item.category = guessCategory(item.description);
   const wantAI = !!photo && aiOn() && (!item.description || loose);
   if (wantAI) item.ai = "pending";
@@ -624,6 +713,7 @@ async function openLive() {
     let res;
     try { res = await readBarcodes(ctx.getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 6, formats: ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128"] }); } catch { continue; }
     const codes = res.filter((x) => x.isValid !== false && x.text).map((x) => ({ format: x.format, text: x.text, pos: relPos(x.position, c.width, c.height) }));
+    if (window.__LIVE_DEBUG) { window.__liveLog = (window.__liveLog || []).concat([[c.width, codes.map((x) => x.text).join(",")]]).slice(-12); if (!window.__frame) window.__frame = c.toDataURL("image/png"); }
     if (!codes.length) continue;
     const r = interpret(codes);
     const key = r.boxCode && !r.item ? "box:" + r.boxCode : r.partRef ? "part:" + r.partRef : r.primary;
@@ -634,6 +724,12 @@ async function openLive() {
       continue;
     }
     if (!r.partRef && !r.has2D && !r.known1D) continue;
+    if (r.multi && !(r.multi.fields.mpn && r.multi.fields.qty != null)) {
+      const f = r.multi.fields;
+      const done = f.supplierPn && state.items.some((i) => i.supplierPn === f.supplierPn && (!f.lot || i.lot === f.lot) && (!f.dateCode || i.dateCode === f.dateCode));
+      flash(done ? "Already counted — skipped" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the rest…`, done ? "warn" : "box");
+      seenAt.delete(key); continue;
+    }
     if (!r.partRef && state.items.some((i) => printable(i.raw) === printable(r.primary))) { beep(260); flash("Already counted — skipped", "warn"); continue; }
     let media = null;
     if (!r.has2D && r.known1D) {
@@ -943,7 +1039,7 @@ function itemCard(it) {
     }
     form.append(h("label", { class: k === "description" || k === "notes" ? "wide" : "" }, h("span", {}, label), input));
   }
-  const meta = [it.order && `Order ${it.order}`, it.po && `PO ${it.po}`, it.invoice && `Invoice ${it.invoice}`, it.line && `Line ${it.line}`, it.lot && `Lot ${it.lot}`, it.coo && `Made in ${it.coo}`, it.serial && `S/N ${it.serial}`].filter(Boolean).join(" · ");
+  const meta = [it.order && `Order ${it.order}`, it.po && `PO ${it.po}`, it.dateCode && `Date code ${it.dateCode}`, it.invoice && `Invoice ${it.invoice}`, it.line && `Line ${it.line}`, it.lot && `Lot ${it.lot}`, it.coo && `Made in ${it.coo}`, it.serial && `S/N ${it.serial}`].filter(Boolean).join(" · ");
   const q = encodeURIComponent(it.mpn || it.supplierPn || it.description || "");
   const addPh = fileInput({ capture: "environment" }, (f) => addPhotoTo(it, f[0], !it.description));
   const actions = h("div", { class: "row actions" },
@@ -959,6 +1055,7 @@ function itemCard(it) {
     it.aiSeen || it.aiConfidence ? h("div", { class: "aiNote" + (it.aiConfidence === "low" ? " low" : "") }, `Claude (${it.aiConfidence || "?"} confidence): ${it.aiSeen || ""}`) : null,
     form,
     meta ? h("div", { class: "meta" }, meta) : null,
+    it.readFrom ? h("div", { class: "meta" }, "Read from — " + it.readFrom) : null,
     h("div", { class: "meta" }, `Counted ${it.at ? fmtTime(it.at) : ""}${it.by ? " by " + nameOf(it.by) : ""}${it.fromOrder ? " · matched your order history" : ""}${it.ai === "failed" ? " · Claude couldn't identify it" : ""}${it.labelPrinted ? " · has own label" : ""}`),
     it.codes?.length ? h("details", { class: "raw" }, h("summary", {}, `${plural(it.codes.length, "barcode")} read`), h("pre", {}, it.codes.map(printable).join("\n"))) : null,
     actions].filter(Boolean));

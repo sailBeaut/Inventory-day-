@@ -121,6 +121,7 @@ export function interpret(codes) {
     if (!txt) continue;
     if (txt.toUpperCase().startsWith(BOX_PREFIX)) { boxCode = txt.slice(BOX_PREFIX.length).trim().toUpperCase(); continue; }
     if (txt.toUpperCase().startsWith(PART_PREFIX)) { partRef = txt.slice(PART_PREFIX.length).trim(); continue; }
+    if (partCodes.some((p) => p.text === txt && p.format === c.format)) continue; // same code seen twice
     partCodes.push({ ...c, text: txt });
   }
   if (!partCodes.length) return { boxCode, partRef, item: null, primary: "", has2D: false };
@@ -137,10 +138,20 @@ export function interpret(codes) {
     }
   }
   const oneD = partCodes.filter((c) => !is2D(c.format)).map((c) => c.text);
-  let known1D = false;
+  let known1D = false, multi = null;
   for (const t of oneD) {
     const f = parseFarnellBarcode(t);
     if (f) { item = { ...f, ...item }; known1D = true; if (!primary && !twoD.length) primary = t; }
+  }
+  // several plain barcodes and no 2D supplier code: work out which barcode is which field from the layout
+  const oneDCodes = partCodes.filter((c) => !is2D(c.format) && !parseFarnellBarcode(c.text));
+  if (!Object.keys(item).length && oneDCodes.length >= 2) {
+    multi = resolveBarcodes(oneDCodes);
+    if (multi.fields.mpn || multi.fields.supplierPn) {
+      item = { ...multi.fields };
+      known1D = true;
+      primary = ["L", item.supplierPn, item.mpn, item.lot, item.dateCode, item.qty].map((x) => x ?? "").join("|");
+    }
   }
   // Mouser part number appears as 1D like "710-150060RS86000"
   if (item.mpn && !item.supplierPn) {
@@ -148,7 +159,7 @@ export function interpret(codes) {
     if (sp) { item.supplierPn = sp; if (!item.supplier) item.supplier = "Mouser"; }
   }
   if (!primary) primary = twoD[0]?.text || oneD.join(" | ");
-  return { boxCode, partRef, item, primary, has2D: twoD.length > 0, known1D, oneD, all: partCodes };
+  return { boxCode, partRef, item, primary, has2D: twoD.length > 0, known1D, multi, oneD, all: partCodes };
 }
 
 export function printable(t) {
@@ -225,4 +236,99 @@ export function guessCategory(text) {
   if (!t) return "";
   for (const [c, re] of CAT_RULES) if (re.test(t)) return c;
   return "";
+}
+
+// ---- labels with one plain barcode per field (new Farnell / element14, RS, many distributors) ----
+// Which field a printed caption belongs to (EN / NL / DE / FR). Fuzzy, because OCR often gets a letter or two wrong.
+const CAPTION_WORDS = [
+  ["mpn", ["fabrikant", "manufacturer", "hersteller", "fabricant", "mfr", "mfg", "manuf"]],
+  ["custPn", ["klant", "customer", "kunde", "client", "cust"]],
+  ["qty", ["hoeveelheid", "quantity", "menge", "anzahl", "aantal", "qty", "quantite"]],
+  ["dateCode", ["datumcode", "datecode", "date", "datum"]],
+  ["lot", ["lotcode", "lot", "charge", "batch"]],
+  ["luid", ["luid", "lu-id"]],
+  ["supplierPn", ["onderdeelnr", "onderdeel", "partno", "part", "bestellnr", "bestellnummer", "ordercode", "stockno"]],
+  ["line", ["artikelnr", "artikel", "line", "lineitem", "item", "pos", "position"]],
+];
+function editDistance(a, b) {
+  const m = a.length, n = b.length, d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 1; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[m][n];
+}
+export function classifyCaption(t) {
+  const words = String(t || "").toLowerCase().replace(/[^a-z0-9äöüéè\- ]+/g, " ").split(/\s+/).filter((w) => w.length >= 3);
+  const hit = (kw) => words.some((w) => {
+    const ww = w.replace(/nr$|no$/, "");
+    if (w === kw || ww === kw) return true;
+    if (kw.length < 5) return false;
+    const tol = kw.length >= 9 ? 2 : 1;
+    return editDistance(ww, kw) <= tol || editDistance(w, kw) <= tol || (w.length >= kw.length && w.includes(kw));
+  });
+  const found = CAPTION_WORDS.filter(([, kws]) => kws.some(hit)).map(([f]) => f);
+  if (found.includes("custPn")) return /order|bestel|auftrag|comman/.test(words.join(" ")) || found.includes("line") === false && found.includes("supplierPn") === false && /ordernr|ordern/.test(words.join(" ")) ? "po" : "custPn";
+  if (/ordernr|ordern\b/.test(words.join(" ")) && found.includes("custPn")) return "po";
+  return found[0] || null;
+}
+// does a barcode value fit the field a caption says it is?
+export function fitsField(f, v) {
+  const t = String(v || "");
+  switch (f) {
+    case "line": return /^\d{1,4}$/.test(t);
+    case "qty": return /^\d{1,7}$/.test(t);
+    case "dateCode": return /^\d{4}$/.test(t) || /^\d{2}[A-Z0-9]{2,4}$/i.test(t);
+    case "supplierPn": return /^[A-Z0-9][A-Z0-9\-]{3,20}$/i.test(t);
+    case "mpn": return /[A-Z]/i.test(t) && t.length >= 3;
+    case "lot": return /^[A-Z0-9][A-Z0-9\-]{2,}$/i.test(t);
+    default: return true;
+  }
+}
+
+// codes: 1D barcodes [{text, pos}] (pos from relPos, incl. aspect `ar`); captions[i]: field from OCR or null.
+// Returns { fields, src } where src[field] is "caption" (barcode + its printed caption) or "pattern" (barcode, field guessed from layout).
+export function resolveBarcodes(codes, captions = []) {
+  const list = codes.map((c, i) => ({ ...c, i, field: captions[i] || null, used: null }));
+  const P = (c, k) => ({ x: c.pos[k].x * (c.pos.ar || 1), y: c.pos[k].y });
+  let v = { x: 0, y: 1 };
+  const posd = list.filter((c) => c.pos);
+  if (posd.length) {
+    const wd = (c) => { const a = P(c, "tl"), b = P(c, "tr"); return Math.hypot(b.x - a.x, b.y - a.y); };
+    const w = posd.reduce((m, c) => (wd(c) > wd(m) ? c : m));
+    const a = P(w, "tl"), b = P(w, "tr"), n = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    v = { x: -(b.y - a.y) / n, y: (b.x - a.x) / n };
+  }
+  const key = (c) => { if (!c.pos) return 0; const a = P(c, "tl"), b = P(c, "br"); return ((a.x + b.x) / 2) * v.x + ((a.y + b.y) / 2) * v.y; };
+  const ord = [...list].sort((a, b) => key(a) - key(b));
+  const F = {}, src = {};
+  const take = (f, c, how) => { if (F[f] == null && c && !c.used) { F[f] = c.text; c.used = f; src[f] = how; } };
+  for (const c of ord) if (c.field && !["luid", "custPn"].includes(c.field)) { if (fitsField(c.field, c.text)) take(c.field, c, "caption"); else c.field = null; }
+  for (const c of ord) if (c.field === "luid" || c.field === "custPn") c.used = c.field;
+  const idx = (f) => ord.findIndex((x) => x.used === f);
+  const isAlnum = (t) => /[A-Z]/i.test(t) && /\d/.test(t) && t.length >= 4;
+  if (F.supplierPn == null) take("supplierPn", ord.find((c) => !c.used && /^\d{6,8}$/.test(c.text)), "pattern");
+  if (F.line == null && F.supplierPn != null) take("line", ord.slice(0, idx("supplierPn")).find((c) => !c.used && /^\d{1,4}$/.test(c.text)), "pattern");
+  // the MPN is the first plain barcode after the supplier code; if that one is a number, the MPN barcode wasn't read — leave it empty rather than guess
+  if (F.mpn == null) { const c = ord.slice(idx("supplierPn") + 1).find((c) => !c.used && !c.field); if (c && isAlnum(c.text)) take("mpn", c, "pattern"); }
+  if (F.qty == null && (F.mpn != null || F.supplierPn != null)) take("qty", ord.slice(Math.max(idx("mpn"), idx("supplierPn")) + 1).find((c) => !c.used && !c.field && /^\d{1,6}$/.test(c.text)), "pattern");
+  if (F.dateCode == null && F.qty != null) { const c = ord[idx("qty") + 1]; if (c && !c.field && /^\d{4}$/.test(c.text)) take("dateCode", c, "pattern"); }
+  if (F.lot == null && F.dateCode != null) { const c = ord[idx("dateCode") + 1]; if (c && !c.field && /^[A-Z0-9][A-Z0-9\-]{3,}$/i.test(c.text)) take("lot", c, "pattern"); }
+  if (F.qty != null) { const n = Number(F.qty); if (Number.isFinite(n)) F.qty = n; else delete F.qty; }
+  return { fields: F, src, order: ord.map((c) => c.i) };
+}
+
+// "Caption: value" lines from OCR text -> { field: value }. Value is cleaned up to what that field can look like.
+export function captionValues(text) {
+  const out = {};
+  for (const raw of String(text || "").split(/\n/)) {
+    const l = raw.replace(/\s+/g, " ").trim();
+    const m = /^(.{3,40}?)\s*[:;.]\s*([A-Za-z0-9][A-Za-z0-9 .\-\/+#]*)$/.exec(l);
+    if (!m) continue;
+    const f = classifyCaption(m[1]);
+    if (!f || f in out || f === "luid" || f === "custPn") continue;
+    let v = m[2].trim();
+    if (f === "qty") { const n = /^\d[\d.,]*/.exec(v.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1")); if (!n) continue; v = n[0].replace(/[.,]/g, ""); }
+    else if (["mpn", "lot", "supplierPn", "dateCode", "line"].includes(f)) v = v.split(" ")[0].toUpperCase();
+    if (v) out[f] = v;
+  }
+  return out;
 }
