@@ -78,6 +78,40 @@ export function parseTME(text) {
   return it;
 }
 
+// Farnell / element14 / Newark / CPC bag label: Code128 "LG1" + 9-digit order number + 3-digit line
+export function parseFarnellBarcode(t) {
+  const m = /^LG\d(\d{9})(\d{3})$/.exec(String(t || "").trim());
+  return m ? { supplier: "Farnell", order: m[1], line: m[2] } : null;
+}
+
+// Printed label text (from on-device OCR) -> fields. Tuned for Farnell-style labels:
+//   1858946            Qty:290
+//   SI2377EDS-T1-GE3:MOSFET,P CH,20V,4.4A,DI
+//   Line017  008576744
+export function parseLabelText(raw) {
+  const text = String(raw || "").replace(/[‘’`´]/g, "'").replace(/[|]/g, "I");
+  const lines = text.split(/\n/).map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const it = {};
+  const q = /\b[QO0]\s*[tTlI1]\s*[yYvV]\s*[:.;]?\s*([0-9OoIl][0-9OoIl,.]*)/.exec(text);
+  if (q) { const n = Number(q[1].replace(/[Oo]/g, "0").replace(/[Il]/g, "1").replace(/[,.]/g, "")); if (Number.isFinite(n) && n > 0 && n < 1e7) it.qty = n; }
+  for (const l of lines) {
+    if (/^(qty|line|rohs|mod|date|lot|tel|fax|www|\d{6,9}\b)/i.test(l)) continue;
+    const m = /^([A-Z0-9][A-Z0-9\-\/.#+_\[\]]{4,40})\s*(?:[:;]\s*|\s+)(.{3,})$/i.exec(l);
+    if (!m) continue;
+    const tok = m[1].replace(/\[/g, "I").replace(/\]/g, "I");
+    if ((tok.match(/\d/g) || []).length >= 2 && (tok.match(/[A-Z]/gi) || []).length >= 2) {
+      it.mpn = tok.toUpperCase();
+      it.description = m[2].replace(/\s*,\s*/g, ", ").replace(/\s+/g, " ").trim().slice(0, 160);
+      break;
+    }
+  }
+  const code = lines.map((l) => /^(\d{6,8})\b/.exec(l)).find(Boolean);
+  if (code) it.supplierPn = code[1];
+  const ln = /\bLine\s*0*(\d{1,4})/i.exec(text);
+  if (ln) it.line = ln[1].padStart(3, "0");
+  return it;
+}
+
 // Takes decoded barcodes [{format,text}] -> { boxCode, item, primary, has2D }
 export function interpret(codes) {
   let boxCode = null, partRef = null;
@@ -87,7 +121,7 @@ export function interpret(codes) {
     if (!txt) continue;
     if (txt.toUpperCase().startsWith(BOX_PREFIX)) { boxCode = txt.slice(BOX_PREFIX.length).trim().toUpperCase(); continue; }
     if (txt.toUpperCase().startsWith(PART_PREFIX)) { partRef = txt.slice(PART_PREFIX.length).trim(); continue; }
-    partCodes.push({ format: c.format, text: txt });
+    partCodes.push({ ...c, text: txt });
   }
   if (!partCodes.length) return { boxCode, partRef, item: null, primary: "", has2D: false };
 
@@ -103,13 +137,18 @@ export function interpret(codes) {
     }
   }
   const oneD = partCodes.filter((c) => !is2D(c.format)).map((c) => c.text);
+  let known1D = false;
+  for (const t of oneD) {
+    const f = parseFarnellBarcode(t);
+    if (f) { item = { ...f, ...item }; known1D = true; if (!primary && !twoD.length) primary = t; }
+  }
   // Mouser part number appears as 1D like "710-150060RS86000"
   if (item.mpn && !item.supplierPn) {
     const sp = oneD.find((t) => /^\d{2,4}-/.test(t) && t.toUpperCase().endsWith(item.mpn.toUpperCase().slice(-6)));
     if (sp) { item.supplierPn = sp; if (!item.supplier) item.supplier = "Mouser"; }
   }
   if (!primary) primary = twoD[0]?.text || oneD.join(" | ");
-  return { boxCode, partRef, item, primary, has2D: twoD.length > 0, oneD, all: partCodes };
+  return { boxCode, partRef, item, primary, has2D: twoD.length > 0, known1D, oneD, all: partCodes };
 }
 
 export function printable(t) {

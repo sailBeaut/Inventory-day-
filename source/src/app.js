@@ -3,7 +3,7 @@ import wasmBin from "../node_modules/zxing-wasm/dist/reader/zxing_reader.wasm";
 import { jsPDF } from "jspdf";
 import qrcode from "qrcode-generator";
 import * as XLSX from "xlsx";
-import { interpret, printable, BOX_PREFIX, PART_PREFIX, parseOrderRows, guessCategory } from "./parse.js";
+import { interpret, printable, BOX_PREFIX, PART_PREFIX, parseOrderRows, guessCategory, parseLabelText } from "./parse.js";
 import { sheetStore } from "./sheet.js";
 import SCRIPT_SOURCE from "./Code.gs";
 
@@ -333,11 +333,12 @@ async function decodeFile(file, { decode = true } = {}) {
       const c = toCanvas(bmp, side);
       if (!first) first = c;
       const res = await readBarcodes(c.getContext("2d").getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 40 });
-      for (const r of res) if (r.isValid !== false && r.text) seen.set(r.format + "|" + r.text, { format: r.format, text: r.text });
+      for (const r of res) if (r.isValid !== false && r.text) seen.set(r.format + "|" + r.text, { format: r.format, text: r.text, pos: relPos(r.position, c.width, c.height) });
       const has2D = [...seen.values()].some((r) => /DataMatrix|QR|PDF417|Aztec/.test(r.format));
       if (has2D || Math.max(bmp.width || 0, bmp.height || 0) <= side) break;
     }
   } else first = toCanvas(bmp, 2000);
+  const ocrCanvas = ocrAvailable() ? toCanvas(bmp, 2600) : null;
   const photo = await canvasBlob(toCanvas(first, 1600));
   let thumb = "";
   for (const [side, q] of [[520, 0.72], [480, 0.6], [420, 0.55], [360, 0.5], [300, 0.45]]) {
@@ -345,7 +346,91 @@ async function decodeFile(file, { decode = true } = {}) {
     if (thumb.length <= 40000) break;
   }
   bmp.close?.();
-  return { codes: [...seen.values()], photo, thumb };
+  return { codes: [...seen.values()], photo, thumb, ocrCanvas };
+}
+function relPos(p, w, h) {
+  if (!p?.topLeft) return null;
+  const f = (q) => ({ x: q.x / w, y: q.y / h });
+  return { tl: f(p.topLeft), tr: f(p.topRight), bl: f(p.bottomLeft), br: f(p.bottomRight) };
+}
+
+/* ================= on-device text reading (OCR) — normal web page only ================= */
+// Reads printed labels whose barcode holds no part data (e.g. Farnell). Downloads ~7 MB once, then cached by the browser.
+const OCR_PATHS = {
+  workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js",
+  corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0",
+  langPath: "https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int",
+};
+const ocrAvailable = () => !INCLAUDE && typeof Worker !== "undefined";
+let ocrWorkerP = null, ocrLoading = false, ocrBusy = 0;
+function getOcr() {
+  if (!ocrWorkerP) {
+    ocrLoading = true; emit();
+    ocrWorkerP = (async () => {
+      const T = await import("tesseract.js");
+      const w = await T.createWorker("eng", 1, { ...OCR_PATHS, ...(window.__OCR_PATHS || {}), gzip: true });
+      await w.setParameters({ tessedit_pageseg_mode: String(window.__OCR_PSM || 6), preserve_interword_spaces: "1" });
+      return w;
+    })().catch((e) => { ocrWorkerP = null; throw e; }).finally(() => { ocrLoading = false; emit(); });
+  }
+  return ocrWorkerP;
+}
+// Crop around a 1D barcode (rotated upright), or use the whole photo
+function ocrCrop(src, code) {
+  const W = src.width, H = src.height, p = code?.pos;
+  if (!p) return toCanvas(src, 2000);
+  const tl = { x: p.tl.x * W, y: p.tl.y * H }, tr = { x: p.tr.x * W, y: p.tr.y * H }, bl = { x: p.bl.x * W, y: p.bl.y * H }, br = { x: p.br.x * W, y: p.br.y * H };
+  const bw = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+  if (bw < 40) return toCanvas(src, 2000);
+  const ang = Math.atan2(tr.y - tl.y, tr.x - tl.x);
+  const cx = (tl.x + tr.x + bl.x + br.x) / 4, cy = (tl.y + tr.y + bl.y + br.y) / 4;
+  const bh = Math.hypot(bl.x - tl.x, bl.y - tl.y) || 0.05 * bw;
+  const g = window.__OCR_GEOM || {};
+  const uL = (g.uL ?? 0.7) * bw, uR = (g.uR ?? 1.5) * bw, vT = (g.vT ?? 0.45) * bw, vB = (g.vB ?? 0.7) * bw;
+  const s = Math.min(3, (g.w ?? 2400) / (uL + uR));
+  const sx = g.sx ?? 1.35; // widen condensed label fonts
+  const c = document.createElement("canvas");
+  c.width = Math.round((uL + uR) * s * sx); c.height = Math.round((vT + vB) * s);
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.translate(uL * s * sx, vT * s); ctx.scale(s * sx, s); ctx.rotate(-ang); ctx.translate(-cx, -cy);
+  ctx.drawImage(src, 0, 0);
+  // blank out the barcode stripes so they aren't read as text (work in the barcode's own frame)
+  ctx.translate(cx, cy); ctx.rotate(ang); ctx.rotate(-ang);
+  ctx.fillStyle = "#fff";
+  const hb = (g.hb ?? 0.072) * bw;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.translate(uL * s * sx, vT * s); ctx.scale(s * sx, s);
+  ctx.fillRect(-bw / 2 - 0.02 * bw, -hb, bw * 1.04, hb * 2);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  enhance(c);
+  return c;
+}
+// grayscale + contrast stretch (helps faded thermal labels and glare)
+function enhance(c) {
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  const im = ctx.getImageData(0, 0, c.width, c.height), d = im.data;
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < d.length; i += 4) { const y = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000 | 0; d[i] = y; hist[y]++; }
+  const n = d.length / 4; let lo = 0, hi = 255, acc = 0;
+  for (; lo < 255; lo++) { acc += hist[lo]; if (acc > n * 0.02) break; }
+  acc = 0; for (; hi > 0; hi--) { acc += hist[hi]; if (acc > n * 0.10) break; }
+  const span = Math.max(30, hi - lo);
+  for (let i = 0; i < d.length; i += 4) { let v = ((d[i] - lo) * 255) / span; v = v < 0 ? 0 : v > 255 ? 255 : v; d[i] = d[i + 1] = d[i + 2] = v; }
+  ctx.putImageData(im, 0, 0);
+}
+async function readLabelText(src, code) {
+  ocrBusy++; emit();
+  try {
+    const w = await getOcr();
+    const crop = ocrCrop(src, code);
+    let { data } = await w.recognize(crop);
+    let fields = parseLabelText(data?.text || "");
+    if (window.__OCR_DEBUG) { window.__crop = crop.toDataURL("image/png"); window.__cropText = data?.text; window.__ocrSrc = src; window.__ocrCode = code; window.__ocrRun = async (psm) => { if (psm) await w.setParameters({ tessedit_pageseg_mode: String(psm) }); const cc = ocrCrop(src, code); window.__crop = cc.toDataURL("image/png"); return (await w.recognize(cc)).data.text; }; }
+    if (code?.pos && !fields.mpn && !fields.qty) { ({ data } = await w.recognize(toCanvas(src, 2000))); fields = parseLabelText(data?.text || ""); }
+    window.__lastOcr = data?.text;
+    return fields;
+  } finally { ocrBusy--; emit(); }
 }
 function dataUrlToBlob(u) {
   const [head, b64] = u.split(","); const bin = atob(b64); const a = new Uint8Array(bin.length);
@@ -429,8 +514,8 @@ async function handleFiles(files, mode = "bag") {
   }
 }
 async function handleOne(file, mode) {
-  const { codes, photo, thumb } = await decodeFile(file);
-  return handleDecoded(codes, { photo, thumb }, mode);
+  const { codes, photo, thumb, ocrCanvas } = await decodeFile(file);
+  return handleDecoded(codes, { photo, thumb, ocrCanvas }, mode);
 }
 async function handleDecoded(codes, media, mode, opts = {}) {
   const photo = media?.photo, thumb = media?.thumb;
@@ -448,6 +533,20 @@ async function handleDecoded(codes, media, mode, opts = {}) {
     toast(it.box === currentBox || !currentBox ? `Found: ${it.description || it.mpn || "part"} (${it.box || "no box"})` : `Found in ${it.box || "no box"} — tap “Move to ${currentBox}” if it lives here now`, "ok");
     emit(); return { kind: "found", text: `Found: ${it.description || it.mpn || "part"} (${it.box || "no box"})` };
   }
+  // Barcode without part data (Farnell etc.) or no barcode at all: read the printed text on the phone
+  let ocrUsed = false;
+  if (mode !== "loose" && !r.has2D && media?.ocrCanvas && ocrAvailable()) {
+    const code1D = (r.all || []).find((c) => c.pos && /^LG\d/.test(String(c.text).trim())) || (r.all || []).find((c) => c.pos);
+    try {
+      const f = await readLabelText(media.ocrCanvas, code1D);
+      if (f.mpn || f.qty || f.supplierPn) {
+        r.item = { ...f, ...(r.item || {}) };
+        if (!r.item.supplier && f.supplierPn && /^\d{7}$/.test(f.supplierPn) && f.mpn) r.item.supplier = "Farnell";
+        ocrUsed = true;
+        if (!r.primary) r.primary = [f.supplierPn, f.mpn, f.qty].filter(Boolean).join("|");
+      }
+    } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — check the internet connection.", "err"); }
+  }
   const loose = mode === "loose" || !r.item;
   if (!r.item && !aiOn() && mode !== "loose") {
     toast("No barcode found — use “Unmarked part” to save it with a photo.", "err"); return;
@@ -459,17 +558,23 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   let item = {
     box: currentBox || "", ...(r.item || {}),
     raw: rawKey, codes: (r.all || []).slice(0, 12).map((c) => printable(`${c.format}: ${c.text}`).slice(0, 300)),
-    at: Date.now(), by: state.me || "", source: loose ? "photo" : "barcode", needsLabel: !r.has2D,
+    at: Date.now(), by: state.me || "", source: loose ? "photo" : ocrUsed ? "label-text" : "barcode", needsLabel: !r.has2D,
   };
+  if (ocrUsed && item.supplierPn) {
+    // the supplier order code is short and digits-only, so it reads reliably — trust your order history over the OCR'd text
+    const row = catalog.bySpn.get(U(item.supplierPn));
+    if (row) { for (const [k, rk] of [["mpn", "m"], ["description", "d"], ["manufacturer", "mf"], ["supplier", "s"]]) if (row[rk]) item[k] = row[rk]; item.fromOrder = true; }
+  }
   item = fillFromCatalog(item);
+  if (ocrUsed && !item.fromOrder) item.needsCheck = true;
   if (!item.category && item.description) item.category = guessCategory(item.description);
   const wantAI = !!photo && aiOn() && (!item.description || loose);
   if (wantAI) item.ai = "pending";
-  if (loose) item.hasPhoto = true;
+  if (loose || (ocrUsed && thumb)) item.hasPhoto = true;
   if (!wantAI && loose && !item.raw) item.needsCheck = true;
   const ok = await write(() => store.set("items", id, item));
   if (!ok) return;
-  if (loose && thumb) savePhoto(id, thumb);
+  if ((loose || ocrUsed) && thumb) savePhoto(id, thumb);
   for (const x of recent) expanded.delete(x);
   recent.unshift(id); if (recent.length > 40) recent.pop();
   expanded.add(id); sessionCount++; sendPresence();
@@ -497,7 +602,7 @@ async function openLive() {
   video.srcObject = stream;
   const info = h("div", { class: "live-info" });
   const last = h("div", { class: "live-last" }, "Point at the square code on a label, or at a box label");
-  let stop = false, count = 0;
+  let stop = false, count = 0, frameNo = 0;
   const close = () => { stop = true; stream.getTracks().forEach((t) => t.stop()); ov.remove(); emit(); };
   const ov = h("div", { class: "liveov" }, video, h("div", { class: "live-frame" }),
     h("div", { class: "live-top" }, info, h("button", { class: "btn", onclick: close }, "Done")), last);
@@ -511,12 +616,14 @@ async function openLive() {
   while (!stop) {
     await new Promise((r) => setTimeout(r, 150));
     if (stop || !video.videoWidth) continue;
-    const sc = Math.min(1, 1600 / Math.max(video.videoWidth, video.videoHeight));
+    frameNo++;
+    const zoom = [1, 0.72, 1.3][frameNo % 3]; // vary scale between frames: thin 1D barcodes decode at some scales and not others
+    const sc = Math.min(1.3, (1600 / Math.max(video.videoWidth, video.videoHeight)) * zoom);
     c.width = Math.round(video.videoWidth * sc); c.height = Math.round(video.videoHeight * sc);
     ctx.drawImage(video, 0, 0, c.width, c.height);
     let res;
-    try { res = await readBarcodes(ctx.getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 6, formats: ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec"] }); } catch (err) { console.warn("live decode", err); continue; }
-    const codes = res.filter((x) => x.isValid !== false && x.text).map((x) => ({ format: x.format, text: x.text }));
+    try { res = await readBarcodes(ctx.getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 6, formats: ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128"] }); } catch { continue; }
+    const codes = res.filter((x) => x.isValid !== false && x.text).map((x) => ({ format: x.format, text: x.text, pos: relPos(x.position, c.width, c.height) }));
     if (!codes.length) continue;
     const r = interpret(codes);
     const key = r.boxCode && !r.item ? "box:" + r.boxCode : r.partRef ? "part:" + r.partRef : r.primary;
@@ -526,9 +633,16 @@ async function openLive() {
       if (r.boxCode !== currentBox) { await handleDecoded(codes, null, "bag", { live: true }); beep(660); flash(`Now filling ${r.boxCode}`, "box"); updInfo(); }
       continue;
     }
-    if (!r.partRef && !r.has2D) continue;
+    if (!r.partRef && !r.has2D && !r.known1D) continue;
     if (!r.partRef && state.items.some((i) => printable(i.raw) === printable(r.primary))) { beep(260); flash("Already counted — skipped", "warn"); continue; }
-    const out = await handleDecoded(codes, null, "bag", { live: true });
+    let media = null;
+    if (!r.has2D && r.known1D) {
+      flash("Hold still — reading label text…", "box");
+      const snap = document.createElement("canvas"); snap.width = video.videoWidth; snap.height = video.videoHeight;
+      snap.getContext("2d").drawImage(video, 0, 0);
+      media = { ocrCanvas: snap };
+    }
+    const out = await handleDecoded(codes, media, "bag", { live: true });
     if (out?.kind === "added") { count++; beep(880); flash("✓ " + out.text, "ok"); }
     else if (out) { beep(500); flash(out.text, out.kind === "err" ? "warn" : "ok"); }
     updInfo();
@@ -698,7 +812,7 @@ function buildWorkbook() {
     Manufacturer: i.manufacturer || "", "Manufacturer PN": i.mpn || "", Supplier: i.supplier || "", "Supplier PN": i.supplierPn || "",
     Qty: i.qty === "" || i.qty == null ? "" : Number(i.qty), "PO / order": i.po || i.order || "", Invoice: i.invoice || "", Line: i.line || "",
     Lot: i.lot || "", "Date code": i.dateCode || "", "Country of origin": i.coo || "", Serial: i.serial || "", Notes: i.notes || "",
-    "How identified": i.raw ? "Supplier barcode" : i.source === "order" ? "Picked from orders" : i.source === "photo" ? (i.aiConfidence ? `Claude from photo (${i.aiConfidence} confidence)` : "Photo") : "By hand",
+    "How identified": i.source === "label-text" ? "Barcode + label text (check)" : i.raw ? "Supplier barcode" : i.source === "order" ? "Picked from orders" : i.source === "photo" ? (i.aiConfidence ? `Claude from photo (${i.aiConfidence} confidence)` : "Photo") : "By hand",
     "Needs check": i.needsCheck ? "yes" : "", "Own label": i.labelPrinted ? PART_PREFIX + i.id : "",
     "Counted by": realName(i.by), "Counted at": i.at ? new Date(i.at).toLocaleString() : "", "Raw barcode": printable(i.raw),
   }));
@@ -773,6 +887,8 @@ function statusEl() {
   const pending = aiQueue.length + (aiBusy ? 1 : 0);
   if (pending) bits.push(h("span", { class: "pill busy" }, `Claude identifying ${pending}…`));
   if (state.mode === "sheet" && state.sheetStatus?.pending && state.sheetStatus?.online !== false) bits.push(h("span", { class: "pill busy" }, `Uploading ${state.sheetStatus.pending}…`));
+  if (ocrLoading) bits.push(h("span", { class: "pill busy" }, "Loading text reader (first time only)…"));
+  else if (ocrBusy) bits.push(h("span", { class: "pill busy" }, "Reading label text…"));
   if (aiPaused) bits.push(h("button", { class: "pill btnlink", onclick: () => { aiPaused = false; pumpAI(); emit(); } }, "Resume Claude"));
   return h("div", { class: "status" }, ...bits);
 }
@@ -827,7 +943,7 @@ function itemCard(it) {
     }
     form.append(h("label", { class: k === "description" || k === "notes" ? "wide" : "" }, h("span", {}, label), input));
   }
-  const meta = [it.po && `PO ${it.po}`, it.invoice && `Invoice ${it.invoice}`, it.line && `Line ${it.line}`, it.lot && `Lot ${it.lot}`, it.coo && `Made in ${it.coo}`, it.serial && `S/N ${it.serial}`].filter(Boolean).join(" · ");
+  const meta = [it.order && `Order ${it.order}`, it.po && `PO ${it.po}`, it.invoice && `Invoice ${it.invoice}`, it.line && `Line ${it.line}`, it.lot && `Lot ${it.lot}`, it.coo && `Made in ${it.coo}`, it.serial && `S/N ${it.serial}`].filter(Boolean).join(" · ");
   const q = encodeURIComponent(it.mpn || it.supplierPn || it.description || "");
   const addPh = fileInput({ capture: "environment" }, (f) => addPhotoTo(it, f[0], !it.description));
   const actions = h("div", { class: "row actions" },
@@ -836,6 +952,7 @@ function itemCard(it) {
     ro ? null : h("button", { class: "btn small", onclick: () => addPh.click() }, it.hasPhoto ? "New photo" : "Add photo"), addPh,
     it.hasPhoto && aiOn() && !ro && it.ai !== "pending" ? h("button", { class: "btn small", onclick: () => identifyAgain(it) }, "Ask Claude again") : null,
     q ? h("a", { class: "btn small ghost", href: `https://octopart.com/search?q=${q}`, target: "_blank", rel: "noopener" }, "Look up ↗") : null,
+    it.supplier === "Farnell" && /^\d{6,8}$/.test(it.supplierPn || "") ? h("a", { class: "btn small ghost", href: `https://nl.farnell.com/search?st=${it.supplierPn}`, target: "_blank", rel: "noopener" }, "Farnell ↗") : null,
     ro ? null : h("button", { class: "btn small ghost danger", onclick: () => confirmDelete(it) }, "Delete"));
   card.append(...[
     it.hasPhoto ? photoEl(it.id) : null,

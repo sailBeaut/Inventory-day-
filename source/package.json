@@ -10,6 +10,7 @@
     "jspdf": "^4.2.1",
     "qrcode-generator": "^2.0.4",
     "xlsx": "^0.18.5",
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "tesseract.js": "^7.0.0"
   }
 }
