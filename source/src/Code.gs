@@ -8,12 +8,15 @@ const TEAM_CODE = 'change-me';
 
 const T = {
   Items: ['id', 'box', 'category', 'description', 'manufacturer', 'mpn', 'supplier', 'supplierPn', 'qty', 'notes', 'po', 'invoice', 'line', 'lot', 'dateCode', 'coo', 'serial', 'order',
-    'source', 'needsCheck', 'needsLabel', 'labelPrinted', 'hasPhoto', 'fromOrder', 'ai', 'aiConfidence', 'aiSeen', 'by', 'at', 'updatedAt', 'deleted', 'raw', 'codes', 'readFrom', 'count', 'countStatus', 'countedBy', 'countedAt', 'list'], // new columns only ever go at the end
-  Boxes: ['id', 'name', 'location', 'printed', 'hasPhoto', 'by', 'createdAt', 'updatedAt', 'deleted', 'list'],
+    'source', 'needsCheck', 'needsLabel', 'labelPrinted', 'hasPhoto', 'fromOrder', 'ai', 'aiConfidence', 'aiSeen', 'by', 'at', 'updatedAt', 'deleted', 'raw', 'codes', 'readFrom', 'count', 'countStatus', 'countedBy', 'countedAt', 'list', 'extra'], // new columns only ever go at the end
+  Boxes: ['id', 'name', 'location', 'printed', 'hasPhoto', 'by', 'createdAt', 'updatedAt', 'deleted', 'list', 'extra'],
   Orders: ['imp', 'file', 'supplier', 'at', 'by', 's', 'sp', 'm', 'mf', 'd', 'q'],
   Photos: ['id', 'data', 'at'],
 };
 const NUMERIC = { qty: 1, q: 1, count: 1 };
+// The page checks this: an older script silently drops fields it doesn't know (that is how counts got lost).
+// Fields this version doesn't have a column for are kept in the 'extra' column, so a future page can't lose data either.
+const VERSION = 3;
 
 function doGet() {
   return json({ ok: true, app: 'inventory-day', note: 'This is the backend. Paste this URL into the inventory page.' });
@@ -28,7 +31,7 @@ function doPost(e) {
 
 function handle(req) {
   switch (req.op) {
-    case 'ping': return { ok: true, sheet: SpreadsheetApp.getActive().getName(), url: SpreadsheetApp.getActive().getUrl() };
+    case 'ping': return { ok: true, version: VERSION, cols: T.Items, sheet: SpreadsheetApp.getActive().getName(), url: SpreadsheetApp.getActive().getUrl() };
     case 'sync': return sync(req);
     case 'upsert': return locked(() => upsert(table(req.table), req.rows || []));
     case 'delete': return locked(() => upsert(table(req.table), (req.ids || []).map((id) => ({ id: id, deleted: 'true' }))));
@@ -76,6 +79,8 @@ function readAll(name) {
   return sh.getRange(2, 1, n - 1, cols.length).getValues().map((r, i) => {
     const o = { _row: i + 2 };
     cols.forEach((c, j) => { o[c] = r[j]; });
+    if (o.extra) { try { const x = JSON.parse(o.extra); Object.keys(x).forEach((k) => { if (!(k in o) || o[k] === '') o[k] = x[k]; }); } catch (e) {} }
+    delete o.extra;
     return o;
   });
 }
@@ -110,6 +115,11 @@ function upsert(name, rows, quiet) {
     const merged = Object.assign({}, cur || {}, r);
     if (name !== 'Photos') merged.updatedAt = now;
     delete merged._row;
+    if (cols.indexOf('extra') >= 0) {
+      const x = {};
+      Object.keys(merged).forEach((k) => { if (cols.indexOf(k) < 0 && merged[k] !== '' && merged[k] != null && typeof merged[k] !== 'object') x[k] = merged[k]; });
+      merged.extra = Object.keys(x).length ? JSON.stringify(x) : '';
+    }
     const line = cols.map((c) => cell(c, merged[c]));
     if (cur) sh.getRange(cur._row, 1, 1, cols.length).setValues([line]);
     else { fresh.push(line); idx[id] = Object.assign({ _row: -1 }, merged); }
@@ -167,7 +177,7 @@ function sync(req) {
     boxes = readAll('Boxes').filter((r) => Number(r.updatedAt || 0) >= since).map(strip);
   }
   return {
-    now: now, items: items, boxes: boxes, ov: getV('ov'),
+    now: now, version: VERSION, cols: T.Items, items: items, boxes: boxes, ov: getV('ov'),
     presence: Object.keys(pres).map((k) => Object.assign({ dev: k }, pres[k])),
   };
 }

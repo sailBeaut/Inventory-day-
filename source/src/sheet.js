@@ -2,6 +2,9 @@
 const BOOL = ["needsCheck", "needsLabel", "labelPrinted", "hasPhoto", "fromOrder", "printed", "deleted"];
 const NUM = ["qty", "at", "updatedAt", "createdAt", "count", "countedAt"];
 const TABLE = { items: "items", boxes: "boxes" };
+// Fields an outdated sheet script (before version 3) silently drops. They are also kept on this phone until the sheet
+// returns them, and sent again once the script is updated — so a count typed in is never lost.
+const HELD = ["count", "countStatus", "countedBy", "countedAt", "list", "readFrom"];
 
 function lsGet(k, d) { try { const v = localStorage.getItem("inv:" + k); return v == null ? d : JSON.parse(v); } catch { return d; } }
 function lsSet(k, v) { try { localStorage.setItem("inv:" + k, JSON.stringify(v)); } catch {} }
@@ -37,6 +40,35 @@ export function sheetStore({ api, key, onStatus, onPresence, getMe }) {
 
   const visible = (c) => [...cache[c].values()].filter((d) => !d.deleted);
   const push = (c) => { const list = c === "catalog" ? catalogDocs : visible(c); subs[c].forEach((cb) => cb(list)); };
+  // held[table][id] = { fields…, _t } — fields the sheet hasn't confirmed yet
+  const held = lsGet("held", { items: {}, boxes: {} });
+  const srv = { items: new Map(), boxes: new Map() }; // rows exactly as the sheet last sent them
+  const saveHeld = () => lsSet("held", held);
+  function hold(table, r) {
+    const f = {};
+    for (const k of HELD) if (k in r) f[k] = r[k];
+    if (!Object.keys(f).length) return;
+    held[table] = held[table] || {};
+    held[table][r.id] = { ...(held[table][r.id] || {}), ...f, _t: Date.now(), _sent: 0 };
+    saveHeld();
+  }
+  const same = (a, b) => (a ?? "") === (b ?? "") || (a != null && b != null && String(a) === String(b));
+  // after a sync: drop what the sheet confirms, keep the rest on top, and re-send it if the script can store it now
+  function reconcile(c, d) {
+    const h = held[c]?.[d.id];
+    if (!h) return d;
+    const left = Object.keys(h).filter((k) => !k.startsWith("_") && !same(d[k], h[k]));
+    if (!left.length) { delete held[c][d.id]; saveHeld(); return d; }
+    if (status.version >= 3 && Date.now() - (h._sent || 0) > 60000 && !outbox.some((o) => o.op === "upsert" && o.table === c && o.rows.some((r) => r.id === d.id))) {
+      h._sent = Date.now(); saveHeld();
+      const row = { id: d.id }; for (const k of left) row[k] = h[k];
+      outbox.push({ op: "upsert", table: c, rows: [row] });
+    }
+    const o = { ...d }; for (const k of left) o[k] = h[k];
+    return o;
+  }
+  const heldCount = () => Object.values(held).reduce((n, t) => n + Object.keys(t || {}).length, 0);
+
   function applyLocal(op) {
     if (op.op === "upsert") for (const r of op.rows) cache[op.table].set(r.id, { ...(cache[op.table].get(r.id) || { id: r.id }), ...r });
     if (op.op === "delete") for (const id of op.ids) { const d = cache[op.table].get(id); if (d) cache[op.table].set(id, { ...d, deleted: true }); }
@@ -50,6 +82,7 @@ export function sheetStore({ api, key, onStatus, onPresence, getMe }) {
         if (i >= 0) last.rows[i] = { ...last.rows[i], ...r }; else last.rows.push(r);
       }
     } else outbox.push(op);
+    if (op.op === "upsert") for (const r of op.rows) hold(op.table, r);
     applyLocal(op);
     lsSet("outbox", outbox.filter((o) => o.op !== "setPhoto"));
     push(op.table || "items"); report();
@@ -86,7 +119,12 @@ export function sheetStore({ api, key, onStatus, onPresence, getMe }) {
     try {
       const j = await call("sync", { since: since ? since - 4000 : 0, me: getMe?.() });
       let changed = { items: false, boxes: false };
-      for (const c of ["items", "boxes"]) for (const raw of j[c] || []) { const d = norm(raw); if (!d.id) continue; cache[c].set(d.id, d); changed[c] = true; }
+      status.version = Number(j.version) || 1;
+      status.oldScript = status.version < 3;
+      for (const c of ["items", "boxes"]) for (const raw of j[c] || []) { const d = norm(raw); if (!d.id) continue; srv[c].set(d.id, d); cache[c].set(d.id, reconcile(c, d)); changed[c] = true; }
+      // rows that haven't changed on the sheet still need their held fields re-sent after a script update
+      if (status.version >= 3) for (const c of ["items", "boxes"]) for (const id of Object.keys(held[c] || {})) { const d = srv[c].get(id); if (d) { cache[c].set(id, reconcile(c, d)); for (const op of outbox) if (op.op === "upsert" && op.table === c && op.rows.some((r) => r.id === id)) applyLocal(op); } }
+      status.held = heldCount();
       for (const op of outbox) applyLocal(op); // keep unsent edits on top
       since = j.now;
       status.online = true; if (status.error !== "bad_key") status.error = ""; status.lastSync = Date.now(); report();

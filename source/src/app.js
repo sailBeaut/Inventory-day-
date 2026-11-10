@@ -56,7 +56,9 @@ function fileInput(opts, onFiles) {
 const CATEGORIES = ["Resistor", "Capacitor", "Inductor", "Diode/LED", "Transistor/MOSFET", "IC", "Microcontroller", "Connector", "Cable/Wire", "Crystal/Oscillator", "Fuse/Protection", "Switch/Button", "Sensor", "Module/PCB", "Mechanical", "Other"];
 // Two separate lists: electrical / PCB parts, and wiring-harness (WH) parts. Each has its own boxes (B001… / W001…).
 const LISTS = { el: { name: "Electrical", prefix: "B" }, wh: { name: "Wiring harness (WH)", prefix: "W" } };
-const listOf = (x) => (x && x.list === "wh" ? "wh" : "el");
+// list; W-boxes (and parts in them) are WH even if an old sheet script dropped the list field
+const waitPn = new Map(); // live scan: labels waiting for their part-number barcode
+const listOf = (x) => (x && (x.list === "wh" || (!x.list && /^W\d/.test(String(x.box || (x.name !== undefined || x.location !== undefined ? x.id : "") || "")))) ? "wh" : "el");
 const catsFor = (l) => (l === "wh" ? WH_CATEGORIES : CATEGORIES);
 const FIELDS = [
   ["description", "Description"], ["category", "Category"], ["manufacturer", "Manufacturer"], ["mpn", "Manufacturer PN"],
@@ -702,6 +704,19 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   };
   put(r.fields2D, "QR code");
   put(r.fields1D, "barcode");
+  // a stripe barcode that looks like a part number (letters + digits) and isn't already another field. Longest wins;
+  // codes printed sideways along the edge (Mouser's 393M2T-style routing code) are skipped when level ones exist.
+  const pnFromBarcodes = () => {
+    const used = new Set(Object.values(merged).map(String));
+    const flat = (c) => !c.pos || Math.abs((c.pos.tr.x - c.pos.tl.x) * (c.pos.ar || 1)) >= Math.abs(c.pos.tr.y - c.pos.tl.y);
+    const pl = (r.all || []).filter((c) => !is2DFormat(c.format) && !parseFarnellBarcode(c.text));
+    const lvl = pl.some(flat) ? pl.filter(flat) : pl;
+    return lvl.map((c) => String(c.text).trim())
+      .filter((v) => !used.has(v) && v.length >= 6 && v.length <= 40 && (v.match(/[A-Z]/gi) || []).length >= 2 && (v.match(/\d/g) || []).length >= 2 && /^[A-Z0-9][A-Z0-9\-\/.#+_,]+$/i.test(v))
+      .sort((a, b) => b.length - a.length)[0];
+  };
+  // square code without a part number (Mouser China labels): the MPN is one of the stripe barcodes
+  if (r.has2DData && !merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
   let ocrUsed = false;
   const needText = () => !merged.mpn || merged.qty == null || (!opts.live && !merged.description);
   if (mode !== "loose" && ocrAvailable() && media?.ocrCanvas && needText()) {
@@ -744,11 +759,7 @@ async function handleDecoded(codes, media, mode, opts = {}) {
       put(t, "text");
       if (merged.supplierPn && src.supplierPn === "text" && U(merged.supplierPn) === U(merged.mpn)) { delete merged.supplierPn; delete src.supplierPn; }
       // still no part number: a stripe barcode that looks like one (letters + digits, e.g. Code 39 *ASX602-06SN-HE-R*)
-      if (!merged.mpn) {
-        const used = new Set(Object.values(merged).map(String));
-        const pn = plain.map((c) => String(c.text).trim()).find((v) => !used.has(v) && v.length >= 6 && v.length <= 40 && (v.match(/[A-Z]/gi) || []).length >= 2 && (v.match(/\d/g) || []).length >= 2 && /^[A-Z0-9][A-Z0-9\-\/.#+_]+$/i.test(v));
-        if (pn) { merged.mpn = pn; src.mpn = "barcode"; }
-      }
+      if (!merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
       ocrUsed = Object.values(src).some((v) => v.includes("text")) || !!r.captionsSeen;
     } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — using the barcodes only.", "err"); }
   }
@@ -960,6 +971,12 @@ async function openLive() {
       flash(same ? "✓ Done — show the next bag" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the rest…`, same ? "ok" : "box");
       lastSeen.delete(key); continue;
     }
+    // square code without a part number (Mouser China): wait up to 4 s for a frame that also has the MPN barcode
+    if (r.has2DData && !r.fields2D?.mpn && !codes.some((x) => !is2DFormat(x.format) && /[A-Z].*\d.*[A-Z]|\d.*[A-Z].*\d/i.test(x.text) && x.text.length >= 6 && !Object.values(r.fields2D || {}).map(String).includes(x.text))) {
+      const t0 = waitPn.get(key) || now; waitPn.set(key, t0);
+      if (now - t0 < 4000) { flash("Hold still — looking for the part number barcode…", "box"); lastSeen.delete(key); continue; }
+    }
+    waitPn.delete(key);
     let media = null;
     if (!r.has2DData && r.known1D) {
       flash("Hold still — reading label text…", "box");
@@ -1236,11 +1253,12 @@ function bannerEl() {
   const st = state.sheetStatus || {};
   if (state.mode === "local") msg = INCLAUDE ? "Saved on this device only — open this page inside Claude to share the list with your team." : "Saved on this phone only. To count together, connect a team Google Sheet on the Setup tab (or open your team's invite link).";
   else if (state.mode === "sheet" && st.error === "bad_key") msg = "The team code is wrong — open the invite link again or fix it on the Setup tab.";
+  else if (state.mode === "sheet" && st.oldScript) msg = `⚠ The Google Sheet runs an old version of the script: it does NOT store counts or the WH list. They are kept on this phone only${st.held ? ` (${plural(st.held, "part")} waiting)` : ""} until the sheet owner updates the script — Setup tab → step 2, then Deploy → Manage deployments → edit → New version. Don't clear this browser's data until then.`;
   else if (state.mode === "sheet" && st.online === false) msg = `Offline — ${st.pending ? plural(st.pending, "change") + " will upload" : "changes will upload"} when the connection is back. Keep scanning.`;
   else if (state.dbError) msg = "Lost connection to the shared list. Reload the page to reconnect.";
   else if (state.slow) msg = "Can't reach the shared list yet — what you see may be out of date.";
   else if (state.readOnly) msg = "View only — you can't add scans yet. See the Setup tab for how to get access.";
-  return msg ? h("div", { class: "banner" }, msg) : null;
+  return msg ? h("div", { class: "banner" + (state.mode === "sheet" && st.oldScript && st.error !== "bad_key" ? " warn" : "") }, msg) : null;
 }
 function statusEl() {
   const bits = [];
