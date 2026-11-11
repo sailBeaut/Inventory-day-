@@ -842,10 +842,10 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   // looks like a part number is the part number — no need to read text for it
   // (not on full Farnell labels with many barcodes: there a lot code looks like a part number too — captions decide)
   if (!merged.mpn && (!r.multi || r.has2DData || (r.oneD || []).length <= 3)) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
-  let ocrUsed = false, mpnAgree = 0;
+  let ocrUsed = false, mpnAgree = 0, mpnStrong = false;
   // the part number is what matters: once a code gave it (square code, or a Farnell label's barcodes with qty), skip
   // reading text — that is what keeps a scan fast
-  const needText = () => !merged.mpn || (!r.has2DData && r.multi && merged.qty == null);
+  const needText = () => !merged.mpn; // part number found = good enough; the real count comes from the count prompt
   if (mode !== "loose" && ocrAvailable() && media?.ocrCanvas && needText()) {
     const oneD = (r.all || []).filter((c) => !is2DFormat(c.format));
     const plain = oneD.filter((c) => !parseFarnellBarcode(c.text));
@@ -873,7 +873,7 @@ async function handleDecoded(codes, media, mode, opts = {}) {
           // the key-line part number replaces an earlier text read only when a caption (or NXP suffix) backs it
           const useK = K.fields.mpn && (!t.mpn || (K.mpnStrong && K.mpnAgree >= 2) || cleanMpn(t.mpn) === K.fields.mpn);
           t = { ...K.fields, ...t };
-          if (useK) { t.mpn = K.fields.mpn; mpnAgree = K.mpnAgree; }
+          if (useK) { t.mpn = K.fields.mpn; mpnAgree = K.mpnAgree; mpnStrong = !!K.mpnStrong; }
         }
       }
       // still thin (dot-matrix print, label off-centre): find the label in the photo and read it at two sizes
@@ -914,7 +914,8 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   // a read from codes always counts; text alone must give at least two part fields (a stray word on the bag is not a part)
   const fromCode = Object.values(src).some((v) => /QR|barcode/.test(v));
   const textHits = ["mpn", "supplierPn", "qty", "description"].filter((k) => merged[k] != null && merged[k] !== "").length;
-  const found = fromCode ? !!(merged.mpn || merged.supplierPn || merged.ean || merged.description || merged.order) : textHits >= 2;
+  // the part number alone is enough when it came from a caption line / several agreeing reads (not a stray word)
+  const found = fromCode ? !!(merged.mpn || merged.supplierPn || merged.ean || merged.description || merged.order) : textHits >= 2 || (!!merged.mpn && (mpnAgree >= 2 || mpnStrong));
 
   // 4) nothing readable: manual entry (photo kept so it can be typed from it later)
   let loose = mode === "loose";
@@ -1133,20 +1134,23 @@ async function openLive() {
       if (r.boxCode !== currentBox) { await handleDecoded(codes, null, "bag", { live: true }); beep(660); flash(`Now filling ${r.boxCode}`, "box"); updInfo(); }
       continue;
     }
-    // retail packs (EAN/UPC barcode only, e.g. Kemo): take the EAN and read the part number from the text once
+    // retail packs (EAN/UPC barcode only, e.g. Kemo) and loose part-number barcodes (TE/Deutsch Code 39): take them
     const retail = !r.has2DData && !r.known1D && codes.some((c) => /EAN|UPC/i.test(c.format));
-    if (!r.partRef && !r.has2DData && !r.known1D && !retail) continue;
-    // multi-barcode label still missing its part-number barcode: wait up to 4 s, then read the part-number line as text
+    const loosePn = !r.has2DData && !r.known1D && codes.length <= 3 && codes.some((c) => !is2DFormat(c.format) && c.text.length >= 6 && /[A-Z].*\d|\d.*[A-Z]/i.test(c.text) && (c.text.match(/[A-Z]/gi) || []).length >= 2);
+    if (!r.partRef && !r.has2DData && !r.known1D && !retail && !loosePn) continue;
+    // The part number is what counts. A multi-barcode label that already has it is taken right away (no waiting for qty
+    // or anything else). One that doesn't: wait at most 3 s for its barcode, then read the part number from the text.
     let readPnLine = retail;
-    const wk = r.multi?.fields.supplierPn ? "sp:" + r.multi.fields.supplierPn : ""; // frames catch different barcodes: key on the order code
-    if (wk && !r.multi.fields.mpn) {
-      const t0 = waitPn.get(wk) || now; waitPn.set(wk, t0);
-      if (now - t0 >= 4000) readPnLine = true;
+    const wk = r.multi ? "multi" : ""; // frames catch different barcodes of the same label: one shared timer
+    if (r.multi && !r.multi.fields.mpn) {
+      const w0 = waitPn.get(wk);
+      const t0 = w0 && now - w0.last < 1500 ? w0.t0 : now; waitPn.set(wk, { t0, last: now });
+      if (now - t0 >= 3000) readPnLine = true;
     }
-    if (!readPnLine && r.multi && !(r.multi.fields.mpn && r.multi.fields.qty != null)) {
+    if (!readPnLine && r.multi && !r.multi.fields.mpn) {
       const f = r.multi.fields;
       const same = lastLive && f.supplierPn && lastLive.supplierPn === f.supplierPn && (!f.lot || lastLive.lot === f.lot);
-      flash(same ? "✓ Done — show the next bag" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the rest…`, same ? "ok" : "box");
+      flash(same ? "✓ Done — show the next bag" : `Hold still — ${plural(codes.length, "barcode")} found, looking for the part number…`, same ? "ok" : "box");
       lastSeen.delete(key); continue;
     }
     // square code without a part number (Mouser China): wait up to 4 s for a frame that also has the MPN barcode
