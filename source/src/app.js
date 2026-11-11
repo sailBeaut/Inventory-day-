@@ -57,6 +57,7 @@ const CATEGORIES = ["Resistor", "Capacitor", "Inductor", "Diode/LED", "Transisto
 // Two separate lists: electrical / PCB parts, and wiring-harness (WH) parts. Each has its own boxes (B001… / W001…).
 const LISTS = { el: { name: "Electrical", prefix: "B" }, wh: { name: "Wiring harness (WH)", prefix: "W" } };
 // list; W-boxes (and parts in them) are WH even if an old sheet script dropped the list field
+if (typeof window !== "undefined") window.__testOcr = { readKeyLines: (...a) => readKeyLines(...a), loadBitmap: (...a) => loadBitmap(...a), toCanvas: (...a) => toCanvas(...a) };
 const waitPn = new Map(); // live scan: labels waiting for their part-number barcode
 const listOf = (x) => (x && (x.list === "wh" || (!x.list && /^W\d/.test(String(x.box || (x.name !== undefined || x.location !== undefined ? x.id : "") || "")))) ? "wh" : "el");
 const catsFor = (l) => (l === "wh" ? WH_CATEGORIES : CATEGORIES);
@@ -342,9 +343,9 @@ async function loadBitmap(file) {
     finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
   }
 }
-function toCanvas(src, maxSide) {
+function toCanvas(src, maxSide, up = false) {
   const W = src.width || src.naturalWidth, H = src.height || src.naturalHeight;
-  const s = Math.min(1, maxSide / Math.max(W, H));
+  const s = up ? maxSide / Math.max(W, H) : Math.min(1, maxSide / Math.max(W, H));
   const c = document.createElement("canvas");
   c.width = Math.max(1, Math.round(W * s)); c.height = Math.max(1, Math.round(H * s));
   c.getContext("2d", { willReadFrequently: true }).drawImage(src, 0, 0, c.width, c.height);
@@ -356,18 +357,21 @@ async function decodeFile(file, { decode = true } = {}) {
   const seen = new Map();
   let first = null;
   if (decode) {
-    for (const side of [2000, 3200]) {
-      const c = toCanvas(bmp, side);
+    // small photos (WhatsApp sends ~1024 px) are enlarged: thin bars only decode with enough pixels per bar
+    const big = Math.max(bmp.width || 0, bmp.height || 0);
+    for (const side of big < 1800 ? [2000, 2800] : [2000, 3200]) {
+      const c = toCanvas(bmp, side, big < 1800);
       if (!first) first = c;
       const res = await readBarcodes(c.getContext("2d").getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 40, formats: LABEL_FORMATS });
       for (const r of res) if (r.isValid !== false && r.text) seen.set(r.format + "|" + r.text, { format: r.format, text: r.text, pos: relPos(r.position, c.width, c.height) });
       const has2D = [...seen.values()].some((r) => /DataMatrix|QR|PDF417|Aztec/.test(r.format));
-      if (has2D || Math.max(bmp.width || 0, bmp.height || 0) <= side) break;
+      if (has2D || (big >= 1800 && big <= side) || (big < 1800 && seen.size >= 3)) break;
     }
     // stripe barcodes only: look again close-up around each one — neighbours with thin bars (Code 39 on TE/Deutsch
     // bags, behind glare) often only decode from an enlarged crop
     const all = [...seen.values()];
-    if (all.length && all.length < 6 && !all.some((r) => /DataMatrix|QR|PDF417|Aztec/.test(r.format))) {
+    const pnLike = (t) => t.length >= 6 && (t.match(/[A-Z]/gi) || []).length >= 2 && (t.match(/\d/g) || []).length >= 2 && !/^GB\d/.test(t);
+    if (all.length && all.length < 6 && !all.some((r) => /DataMatrix|QR|PDF417|Aztec/.test(r.format)) && !all.some((r) => pnLike(r.text))) {
       const BW = bmp.width, BH = bmp.height, done = [];
       for (const r of all.filter((x) => x.pos).slice(0, 3)) {
         const xs = ["tl", "tr", "br", "bl"].map((k) => r.pos[k].x * BW), ys = ["tl", "tr", "br", "bl"].map((k) => r.pos[k].y * BH);
@@ -389,7 +393,7 @@ async function decodeFile(file, { decode = true } = {}) {
       }
     }
   } else first = toCanvas(bmp, 2000);
-  const ocrCanvas = ocrAvailable() ? toCanvas(bmp, 2600) : null;
+  const ocrCanvas = ocrAvailable() ? toCanvas(bmp, 2600, Math.max(bmp.width || 0, bmp.height || 0) < 1800) : null;
   const photo = await canvasBlob(toCanvas(first, 1600));
   let thumb = "";
   for (const [side, q] of [[520, 0.72], [480, 0.6], [420, 0.55], [360, 0.5], [300, 0.45]]) {
@@ -576,57 +580,110 @@ async function readLabel(src, codes, opt = {}) {
 const MPN_CAPTION = /(art(?:ikel|\.)?\s*n[ro]\.?\s*fa[bh][a-z]{0,3}[ic]?k?ant|onderdeelnr\.?\s*fab|manuf[a-z]*\s*(part|p\/?n|no|nr|#)|mfr\.?\s*(part|p\/?n|no|#)|mpn|hersteller[a-z\-]*\s*(teil|nr|art)|herstellerteil|r[ée]f[ée]?r?e?n?c?e?\.?\s*fabricant|\bP\s?\/\s?N\b|^\s*type\b|order\s?p\s?\/?\s?n)/i;
 const MPN_VALUE = /[:;]?\s*([A-Z0-9][A-Z0-9 \-\/.,#+_()]{2,40})\s*$/i;
 function cleanMpn(v) {
-  let t = String(v || "").trim().replace(/^[^A-Z0-9]+/i, "").replace(/[^A-Z0-9)]+$/i, "");
+  let t = String(v || "").trim().replace(/[@Ø]/g, "0").replace(/^[\[\/](?=\d[A-Z0-9])/i, "7").replace(/^[^A-Z0-9]+/i, "").replace(/[^A-Z0-9)]+$/i, "");
+  if (/^\d{1,2}-[A-Z]{3}-\d{2,4}/i.test(t) || /^\d+$/.test(t.replace(/[\s\-.]/g, "")) || /-N[D0O]$/i.test(t)) return ""; // dates, plain numbers, DigiKey numbers
   t = t.replace(/[ .](\d{3})$/, ",$1"); // NXP/Nexperia packing suffix: "74HC2G08DC 125" → "74HC2G08DC,125"
   t = t.replace(/\s+/g, "");
   return t.length >= 3 && /\d/.test(t) && /[A-Z]/i.test(t) ? t.toUpperCase() : "";
 }
-async function readMpnLine(src) {
-  const w = await getOcr();
-  await w.setParameters({ tessedit_pageseg_mode: "11" });
-  const page = toCanvas(src, 2000); enhance(page);
-  const { data } = await w.recognize(page, {}, { blocks: true, text: true });
-  const lines = (data?.blocks || []).flatMap((b) => (b.paragraphs || []).flatMap((p) => p.lines || []));
-  // use the caption line's own box: its value sits on the same baseline, to its right
-  const rows = lines.map((l) => ({ text: l.text.trim(), bbox: { ...l.bbox } })).filter((r) => r.bbox.y1 - r.bbox.y0 < 0.06 * page.height);
-  const cap = rows.filter((r) => MPN_CAPTION.test(r.text)).sort((a, b) => (/fab|manuf|mfr|herstell/i.test(b.text) ? 1 : 0) - (/fab|manuf|mfr|herstell/i.test(a.text) ? 1 : 0))[0];
-  if (window.__OCR_DEBUG) window.__mpnRows = rows.map((r) => [r.text, Math.round(r.bbox.x0), Math.round(r.bbox.y0), Math.round(r.bbox.x1), Math.round(r.bbox.y1), MPN_CAPTION.test(r.text)]);
-  if (!cap) return null;
-  const k = src.width / page.width, b = cap.bbox, lh = (b.y1 - b.y0) * k;
-  const x0 = Math.max(0, b.x0 * k - lh), x1 = Math.min(src.width, Math.max(b.x1 * k + 6 * lh, b.x0 * k + 30 * lh));
-  const y0 = Math.max(0, b.y0 * k - 0.35 * lh), y1 = Math.min(src.height, b.y1 * k + 0.35 * lh);
-  await w.setParameters({ tessedit_pageseg_mode: "7" });
-  const reads = [];
-  for (const targetH of [34, 48, 26, 62]) {
-    const sc = targetH / lh, cv = document.createElement("canvas");
-    cv.width = Math.max(8, Math.round((x1 - x0) * sc)); cv.height = Math.max(8, Math.round((y1 - y0) * sc));
-    cv.getContext("2d", { willReadFrequently: true }).drawImage(src, x0, y0, x1 - x0, y1 - y0, 0, 0, cv.width, cv.height);
-    const r = (await w.recognize(cv)).data;
-    const t = (r?.text || "").replace(/\s+/g, " ").trim();
-    const m = MPN_CAPTION.exec(t);
-    const after = m ? t.slice(m.index + m[0].length) : t;
-    const v = cleanMpn((MPN_VALUE.exec(after) || [])[1] || "");
-    if (v) reads.push({ v, conf: r?.confidence || 0 });
-    if (window.__OCR_DEBUG) (window.__mpnLines = window.__mpnLines || []).push([targetH, t]);
-  }
-  if (!reads.length) return null;
-  const votes = new Map();
-  for (const r of reads) { const e = votes.get(r.v) || { n: 0, conf: 0 }; e.n++; e.conf = Math.max(e.conf, r.conf); votes.set(r.v, e); }
-  let [best] = [...votes.entries()].sort((a, b) => b[1].n - a[1].n || b[1].conf - a[1].conf)[0];
-  // per character: among reads of the most common length, each position takes the character most reads show
-  const lens = new Map(); for (const r of reads) lens.set(r.v.length, (lens.get(r.v.length) || 0) + 1);
+// per character: among the reads of the most common length, each position takes the character most reads show
+function voteStrings(vals) {
+  vals = vals.filter(Boolean);
+  if (!vals.length) return { best: "", agree: 0 };
+  const whole = new Map(); for (const v of vals) whole.set(v, (whole.get(v) || 0) + 1);
+  let best = [...whole.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  const lens = new Map(); for (const v of vals) lens.set(v.length, (lens.get(v.length) || 0) + 1);
   const L = [...lens.entries()].sort((a, b) => b[1] - a[1] || (b[0] === best.length) - (a[0] === best.length))[0][0];
-  const same = reads.filter((r) => r.v.length === L);
+  const same = vals.filter((v) => v.length === L);
   if (same.length >= 3) {
     let out = "";
     for (let i = 0; i < L; i++) {
-      const c = new Map(); for (const r of same) c.set(r.v[i], (c.get(r.v[i]) || 0) + 1);
+      const c = new Map(); for (const v of same) c.set(v[i], (c.get(v[i]) || 0) + 1);
       const top = Math.max(...c.values()), cands = [...c.keys()].filter((ch) => c.get(ch) === top);
-      out += cands.includes(best[i]) ? best[i] : cands[0];
+      out += best.length === L && cands.includes(best[i]) ? best[i] : cands[0];
     }
     best = out;
   }
-  return { mpn: best, agree: reads.filter((r) => r.v === best).length, reads: reads.length };
+  return { best, agree: vals.filter((v) => v === best).length };
+}
+// Read the label once, pick the few lines that matter (part number, supplier number, quantity), then read each of those
+// lines again on its own, enlarged, three times, with only part-number characters allowed. A single line read on its
+// own is far more accurate than the same line inside a whole label; fields (and part-number characters) are voted.
+const KEY_SUPPLIER = /(onderdeel|order\s*code|stock\s*no|best(ell)?[\s.-]*nr|art(ikel)?[\s.]*n[ro]\b|12\s?nc|p\s?\/?\s?n\b|-n[d0o]\b|digi|mouser\s*no|lcsc|mfg|mfr|type\b|qty|hoeveel|menge|quant)/i;
+const looksPn = (t) => /\b(?=[A-Z0-9\-\/+,.#]*[A-Z])(?=[A-Z0-9\-\/+,.#]*\d)[A-Z0-9][A-Z0-9\-\/+,.#]{4,}\b/i.test(t) && !/^\s*(NL|EU_|GB)\d{8,}/i.test(t);
+async function readKeyLines(src, { lines: maxLines = 5, H = [34, 44, 58], wl = "", mx = 26, my = 0.3, pageFirst = true, enh = true } = {}) {
+  const w = await getOcr();
+  await w.setParameters({ tessedit_pageseg_mode: "11", tessedit_char_whitelist: "" });
+  const page = toCanvas(src, 2000); enhance(page);
+  const { data } = await w.recognize(page, {}, { blocks: true, text: true });
+  const pageText = data?.text || "";
+  const lines = (data?.blocks || []).flatMap((b) => (b.paragraphs || []).flatMap((p) => p.lines || []))
+    .map((l) => ({ text: (l.text || "").trim(), bbox: l.bbox }))
+    .filter((l) => l.text.length >= 3 && l.bbox.y1 - l.bbox.y0 < 0.06 * page.height && l.bbox.y1 - l.bbox.y0 > 6);
+  const score = (t) => (MPN_CAPTION.test(t) ? 6 : 0) + (/\+\s?\d{3}\b|-N[D0O]\b|,\d{3}\b|\b[89]\d{3}[ .]{1,2}\d{3}[ .]{1,2}\d{5}\b/i.test(t) ? 4 : 0) + (KEY_SUPPLIER.test(t) ? 3 : 0) + (looksPn(t) ? 2 : 0) - (/invoice|factuur|order\s*#|cust|location|vrachtbon|lp:|date|datum|lot/i.test(t) ? 3 : 0);
+  const pick = lines.map((l) => ({ ...l, s: score(l.text) })).filter((l) => l.s >= 2).sort((a, b) => b.s - a.s).slice(0, maxLines).sort((a, b) => a.bbox.y0 - b.bbox.y0);
+  const k = src.width / page.width;
+  await w.setParameters({ tessedit_pageseg_mode: "7", tessedit_char_whitelist: wl });
+  for (const l of pick) {
+    const b = l.bbox, lh = (b.y1 - b.y0) * k;
+    // the value often sits to the right of what the first pass grouped as this line: take the line's full width
+    const x0 = Math.max(0, b.x0 * k - 1.2 * lh), x1 = Math.min(src.width, Math.max(b.x1 * k + 4 * lh, b.x0 * k + mx * lh));
+    const y0 = Math.max(0, b.y0 * k - my * lh), y1 = Math.min(src.height, b.y1 * k + my * lh);
+    l.reads = [];
+    for (const th of H) {
+      const sc = th / lh, cv = document.createElement("canvas");
+      cv.width = Math.max(8, Math.round((x1 - x0) * sc)); cv.height = Math.max(8, Math.round((y1 - y0) * sc));
+      cv.getContext("2d", { willReadFrequently: true }).drawImage(src, x0, y0, x1 - x0, y1 - y0, 0, 0, cv.width, cv.height);
+      if (enh) enhance(cv);
+      l.reads.push(((await w.recognize(cv)).data?.text || "").replace(/\s+/g, " ").trim());
+    }
+  }
+  await w.setParameters({ tessedit_char_whitelist: "" });
+  // one text per read size (the picked lines, re-read), plus the whole-label text
+  const texts = H.map((_, i) => pick.map((l) => l.reads[i]).join("\n"));
+  const parsed = (pageFirst ? [pageText, ...texts] : [...texts, pageText]).map((t) => ({ ...textExtras(t, []), ...parseLabelText(t), ...captionValues(t) }));
+  const norm = (v) => String(v).replace(/[^A-Z0-9]/gi, "").toUpperCase();
+  const fields = {};
+  for (const key of new Set(parsed.flatMap((f) => Object.keys(f)))) {
+    const vals = parsed.map((f) => f[key]).filter((v) => v != null && v !== "");
+    if (!vals.length) continue;
+    if (key === "mpn") continue;
+    // a description only from the whole-label read (re-read lines are captions and numbers), and never a date/caption
+    if (key === "description") { const d = parsed[0].description; if (d && !/\d{1,2}:\d{2}|digi-?key|^\W*(artikel|onderdeel|order|part|p\/n)/i.test(d) && (d.match(/[A-Za-z]/g) || []).length >= 6) fields.description = d; continue; }
+    const votes = new Map(); for (const v of vals) votes.set(norm(v), (votes.get(norm(v)) || 0) + 1);
+    const top = Math.max(...votes.values());
+    fields[key] = vals.find((v) => votes.get(norm(v)) === top);
+  }
+  // the part number comes from the best line that names it: its caption ("Artikelnr. fabrikant", "MFG P/N", "TYPE" …)
+  // or its shape (NXP "+151" packing suffix). Every read of that line votes, the whole-label read included.
+  const fromLine = (t) => {
+    if (!t) return "";
+    const m = MPN_CAPTION.exec(t);
+    if (m) return cleanMpn((MPN_VALUE.exec(t.slice(m.index + m[0].length).replace(/^[\s:;.,]+/, "")) || [])[1] || "");
+    const tp = /\b([A-Z0-9][A-Z0-9\/\-.]{3,24})\s?\+\s?(\d{3})\b/i.exec(t);
+    return tp && /\d/.test(tp[1]) && /[A-Z]/i.test(tp[1]) ? cleanMpn(tp[1] + "+" + tp[2]) : "";
+  };
+  let mp = { best: "", agree: 0 }, strong = false;
+  for (const l of [...pick].sort((a, b) => b.s - a.s)) {
+    const v = voteStrings([l.text, ...l.reads].map(fromLine));
+    if (v.best && v.best.length >= 4) { mp = v; strong = true; break; }
+  }
+  // no line names it (DigiKey's tiny "MFG P/N"): the most part-number-shaped value on a non-reference line
+  const shapeOf = (t) => {
+    if (!t || /invoice|factuur|order|cust|location|vrachtbon|lp:|date|datum|lot|digi-?key|-N[D0O]\b|\b\d{3}-\d{3}-\d{4}\b/i.test(t)) return "";
+    const toks = (t.replace(/^[^:]{0,10}:\s*/, "").match(/[A-Z0-9@][A-Z0-9@\-\/.,#+]{4,30}(\s(?:TR|CT|ND|T&R)\b)?/gi) || [])
+      .map(cleanMpn).filter((x) => x.length >= 6 && /[A-Z]{2}/i.test(x) && (x.match(/\d/g) || []).length >= 2 && !/^(NL|EU|GB|SAM)\d/i.test(x) && !/^\d{1,3}[.,]\d+[A-Z]{0,2}$/i.test(x));
+    return toks.sort((a, b) => b.length - a.length)[0] || "";
+  };
+  if (!mp.best) for (const l of [...pick].sort((a, b) => b.s - a.s)) {
+    const v = voteStrings([l.text, ...l.reads].map(shapeOf));
+    if (v.best) { mp = v; break; }
+  }
+  if (!mp.best) mp = voteStrings(parsed.map((f) => cleanMpn(f.mpn)));
+  if (mp.best) fields.mpn = mp.best;
+  if (fields.supplierPn && /-N[D0O]$/i.test(fields.supplierPn)) { fields.supplierPn = fields.supplierPn.replace(/-N[D0O]$/i, "-ND"); fields.supplier = "DigiKey"; }
+  if (window.__OCR_DEBUG) { window.__keyLines = pick.map((l) => [l.s, l.text, ...l.reads]); window.__keyFields = parsed; }
+  return { fields, mpnAgree: mp.agree, mpnStrong: strong, text: [pageText, ...texts].join("\n") };
 }
 function textExtras(txt, _lines) {
   const extra = {};
@@ -773,15 +830,20 @@ async function handleDecoded(codes, media, mode, opts = {}) {
       .filter((v) => !used.has(v) && v.length >= 6 && v.length <= 40 && (v.match(/[A-Z]/gi) || []).length >= 2 && (v.match(/\d/g) || []).length >= 2 && /^[A-Z0-9][A-Z0-9\-\/.#+_,]+$/i.test(v))
       .sort((a, b) => b.length - a.length)[0];
   };
-  // square code without a part number (Mouser China labels): the MPN is one of the stripe barcodes
-  if (r.has2DData && !merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
+  // square code without a part number (Mouser China), or loose stripe barcodes (TE/Deutsch Code 39): a barcode that
+  // looks like a part number is the part number — no need to read text for it
+  if ((r.has2DData || !r.multi) && !merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
   let ocrUsed = false, mpnAgree = 0;
-  const needText = () => !merged.mpn || merged.qty == null || (!opts.live && !merged.description);
+  // the part number is what matters: once a code gave it (square code, or a Farnell label's barcodes with qty), skip
+  // reading text — that is what keeps a scan fast
+  const needText = () => !merged.mpn || (!r.has2DData && r.multi && merged.qty == null);
   if (mode !== "loose" && ocrAvailable() && media?.ocrCanvas && needText()) {
     const oneD = (r.all || []).filter((c) => !is2DFormat(c.format));
     const plain = oneD.filter((c) => !parseFarnellBarcode(c.text));
     try {
-      const L = await readLabel(media.ocrCanvas, oneD, { strips: !r.has2DData, quick: !!opts.live });
+      // barcodes with positions anchor the text (captions above each barcode); without them, start with the key lines
+      const anchored = oneD.some((c) => c.pos);
+      const L = anchored ? await readLabel(media.ocrCanvas, oneD, { strips: !r.has2DData, quick: !!opts.live }) : { text: "", captions: [], values: {}, extra: {} };
       if (!r.has2DData) {
         const capOf = new Map(oneD.map((c, i) => [c, L.captions[i]]));
         if (plain.length >= 2 || (plain.length === 1 && capOf.get(plain[0]))) {
@@ -795,11 +857,25 @@ async function handleDecoded(codes, media, mode, opts = {}) {
       let t = L.fields ? { ...L.fields } : { ...L.extra, ...parseLabelText(L.text), ...L.values };
       // the barcodes didn't lead to the printed text (it sits elsewhere on the label): read the label itself too
       const hits = (f) => ["mpn", "supplierPn", "qty", "lot", "description"].filter((k) => f[k] != null && f[k] !== "").length;
+      // no part number yet: the key lines, read one by one (fast, and the most accurate for part numbers)
+      if ((!opts.live || opts.mpnLine) && !merged.mpn) {
+        const K = await readKeyLines(media.ocrCanvas).catch((e) => { console.warn(e); return null; });
+        if (K) {
+          // the key-line part number replaces an earlier text read only when a caption (or NXP suffix) backs it
+          const useK = K.fields.mpn && (!t.mpn || (K.mpnStrong && K.mpnAgree >= 2) || cleanMpn(t.mpn) === K.fields.mpn);
+          t = { ...K.fields, ...t };
+          if (useK) { t.mpn = K.fields.mpn; mpnAgree = K.mpnAgree; }
+        }
+      }
+      // still thin (dot-matrix print, label off-centre): find the label in the photo and read it at two sizes
       if (!L.fields && !opts.live && (hits(t) < 2 || !(t.mpn || merged.mpn))) {
         const L2 = await readLabel(media.ocrCanvas, [], {});
         t = hits(L2.fields) >= hits(t) ? { ...t, ...L2.fields } : { ...L2.fields, ...t };
       }
       if (t.qty != null) t.qty = Number(t.qty);
+      if (t.description && (/\d{1,2}:\d{2}|digi-?key|^\W*(artikel|onderdeel|order|part|p\/n)/i.test(t.description) || (t.description.match(/[A-Za-z]/g) || []).length < 6)) delete t.description;
+      // NXP: the 12NC from the text is the supplier number; a lone barcode (the "LP" box number) is not
+      if (t.supplier === "NXP" && t.supplierPn && src.supplierPn === "barcode" && !r.captionsSeen) { delete merged.supplierPn; delete src.supplierPn; }
       // a plain barcode that repeats a printed value (P/N, batch, …) confirms it — and fixes small text misreads
       for (const c of plain) {
         const v = String(c.text).trim();
@@ -813,11 +889,6 @@ async function handleDecoded(codes, media, mode, opts = {}) {
           delete t[f];
           break;
         }
-      }
-      // the part number line, read on its own (only when no code gave the MPN)
-      if ((!opts.live || opts.mpnLine) && !merged.mpn) {
-        const ml = await readMpnLine(media.ocrCanvas).catch(() => null);
-        if (ml && (!t.mpn || ml.agree >= 2 || cleanMpn(t.mpn) === ml.mpn)) { t.mpn = ml.mpn; mpnAgree = ml.agree; }
       }
       put(t, "text");
       if (merged.supplierPn && src.supplierPn === "text" && U(merged.supplierPn) === U(merged.mpn)) { delete merged.supplierPn; delete src.supplierPn; }

@@ -138,6 +138,25 @@ export function parseLabelText(raw) {
       if ((t.match(/\d/g) || []).length >= 2 && (t.match(/[A-Z]/gi) || []).length >= 2 && !/^(rohs|reach|madein)/i.test(t)) { it.mpn = t.toUpperCase(); break; }
     }
   }
+  // DigiKey part number: 576-2903-1-ND (OCR: "576-2903 1-N0"); the manufacturer part number is on the next line
+  {
+    const T = text.toUpperCase().split(/\n/);
+    for (let i = 0; i < T.length; i++) {
+      const m = /(\d{2,4}-[A-Z0-9][A-Z0-9 \-\/.#]{1,30}?)[\- ]N[D0O]\b/.exec(T[i]);
+      if (!m) continue;
+      it.supplierPn = m[1].trim().replace(/ +/g, "-").replace(/-+/g, "-") + "-ND"; it.supplier = "DigiKey";
+      const nx = (T[i + 1] || "").replace(/^[^:]{0,8}:\s*/, "").replace(/^[A-Z]{1,4}\s+(?=[A-Z0-9]*\d)/, "");
+      const pn = /([A-Z0-9][A-Z0-9\-\/.#,+]{3,30})(\s[A-Z]{1,3}\b)?/.exec(nx);
+      if (pn && /\d/.test(pn[1]) && /[A-Z]/.test(pn[1]) && !it.mpn) it.mpn = (pn[1] + (pn[2] || "")).trim();
+      break;
+    }
+  }
+  // NXP 12NC (9352 800 21151) and TYPE with packing suffix (LPC2148FBD64+151, TJA1050T/VM+118)
+  { const nc = /\b([89]\d{3})[ .]{0,2}(\d{3})[ .]{0,2}(\d{5})\b/.exec(text); if (nc && /12\s?N|NXP|TYPE|\+\d{3}/i.test(text)) { it.supplierPn = "9" + nc[1].slice(1) + nc[2] + nc[3]; it.supplier = it.supplier || "NXP"; } }
+  if (!it.mpn) {
+    const tp = /\b([A-Z0-9][A-Z0-9\/\-.]{3,24})\s?\+\s?(\d{3})\b/.exec(text.toUpperCase());
+    if (tp && /\d/.test(tp[1]) && /[A-Z]/.test(tp[1])) { it.mpn = tp[1] + "+" + tp[2]; if (!it.manufacturer) it.manufacturer = "NXP"; }
+  }
   // NXP-style ordering code: type + packing suffix, e.g. 2N7002,215 / BC847B,215
   if (!it.mpn) {
     const nx = /\b([0-9A-Z][0-9A-Z\-]{3,20}),\s?(\d{3})\b/.exec(text.toUpperCase());
@@ -147,6 +166,8 @@ export function parseLabelText(raw) {
   if (made && !/^(in|ln)$/i.test(made[1])) it.coo = made[1].trim().replace(/\s+/g, " ");
   const ln = /\bLine\s*0*(\d{1,4})/i.exec(text);
   if (ln) it.line = ln[1].padStart(3, "0");
+  if (it.mpn && /-N[D0O]$/i.test(it.mpn)) delete it.mpn; // that's a DigiKey number, not the part number
+  if (it.mpn && (/^\d{1,2}[-\/ .][A-Z]{3}[-\/ .]\d{2,4}/i.test(it.mpn) || /^\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4}$/.test(it.mpn))) delete it.mpn; // dates are never part numbers
   return it;
 }
 
