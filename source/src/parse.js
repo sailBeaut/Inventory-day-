@@ -166,6 +166,14 @@ export function parseLabelText(raw) {
   if (made && !/^(in|ln)$/i.test(made[1])) it.coo = made[1].trim().replace(/\s+/g, " ");
   const ln = /\bLine\s*0*(\d{1,4})/i.exec(text);
   if (ln) it.line = ln[1].padStart(3, "0");
+  // Kemo Electronic retail packs: the article number (S007, B240, M040) is the part number
+  if (/\bkemo\b/i.test(text)) {
+    it.manufacturer = "Kemo Electronic";
+    const km = /\b([BMSFLPZ])\s?([0-9O]{3}[A-Z]?)\b/.exec(text.replace(/kemo[^\n]*electronic/ig, ""));
+    if (km) it.mpn = km[1] + km[2].replace(/O/g, "0");
+    const d = /(CERAMIC|ELECTROLYTIC|FILM|TANTALUM|METAL|CARBON)[A-Z ]{3,40}/i.exec(text); if (d && !it.description) it.description = d[0].trim();
+  }
+  if (it.mpn && /\.\.|^\d+([.,]\d+)?\s?[pnuµmk]?(F|V|A|W|H|Ω|ohm)\b/i.test(it.mpn)) delete it.mpn; // component values / ranges
   if (it.mpn && /-N[D0O]$/i.test(it.mpn)) delete it.mpn; // that's a DigiKey number, not the part number
   if (it.mpn && (/^\d{1,2}[-\/ .][A-Z]{3}[-\/ .]\d{2,4}/i.test(it.mpn) || /^\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4}$/.test(it.mpn))) delete it.mpn; // dates are never part numbers
   return it;

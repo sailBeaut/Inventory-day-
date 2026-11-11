@@ -47,7 +47,7 @@ const SPN = (s) => U(s).replace(/[\s\-]/g, ""); // 155-1908 = 1551908
 // barcode types that appear on part and bag labels (leaving out exotic ones that cause false reads, e.g. DX film edge)
 const LABEL_FORMATS = ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128", "Code39", "Code93", "Codabar", "ITF", "EAN-13", "EAN-8", "UPC-A", "UPC-E", "DataBar", "DataBarExpanded"];
 const is2DFormat = (f) => /DataMatrix|QR|PDF417|Aztec|MaxiCode/.test(f || "");
-const FIELD_LABEL = { mpn: "MPN", qty: "qty", supplierPn: "supplier PN", description: "description", manufacturer: "manufacturer", lot: "lot", dateCode: "date code", line: "line", po: "PO", order: "order", coo: "country" };
+const FIELD_LABEL = { mpn: "MPN", qty: "qty", supplierPn: "supplier PN", ean: "EAN", description: "description", manufacturer: "manufacturer", lot: "lot", dateCode: "date code", line: "line", po: "PO", order: "order", coo: "country" };
 const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 function fileInput(opts, onFiles) {
   return h("input", { type: "file", accept: "image/*", class: "hidden", ...opts, onchange: (e) => { const f = [...e.target.files]; e.target.value = ""; if (f.length) onFiles(f); } });
@@ -63,7 +63,7 @@ const listOf = (x) => (x && (x.list === "wh" || (!x.list && /^W\d/.test(String(x
 const catsFor = (l) => (l === "wh" ? WH_CATEGORIES : CATEGORIES);
 const FIELDS = [
   ["description", "Description"], ["category", "Category"], ["manufacturer", "Manufacturer"], ["mpn", "Manufacturer PN"],
-  ["supplier", "Supplier"], ["supplierPn", "Supplier PN"], ["qty", "Label qty (not verified)"], ["notes", "Notes"],
+  ["supplier", "Supplier"], ["supplierPn", "Supplier PN"], ["ean", "EAN / retail barcode"], ["qty", "Label qty (not verified)"], ["notes", "Notes"],
 ];
 
 /* ================= store ================= */
@@ -348,7 +348,9 @@ function toCanvas(src, maxSide, up = false) {
   const s = up ? maxSide / Math.max(W, H) : Math.min(1, maxSide / Math.max(W, H));
   const c = document.createElement("canvas");
   c.width = Math.max(1, Math.round(W * s)); c.height = Math.max(1, Math.round(H * s));
-  c.getContext("2d", { willReadFrequently: true }).drawImage(src, 0, 0, c.width, c.height);
+  const cx = c.getContext("2d", { willReadFrequently: true });
+  if (s < 1) { cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = "high"; } // rough downscaling breaks thin bars (enlarging stays sharp)
+  cx.drawImage(src, 0, 0, c.width, c.height);
   return c;
 }
 const canvasBlob = (c, q = 0.85) => new Promise((r) => c.toBlob(r, "image/jpeg", q));
@@ -359,13 +361,15 @@ async function decodeFile(file, { decode = true } = {}) {
   if (decode) {
     // small photos (WhatsApp sends ~1024 px) are enlarged: thin bars only decode with enough pixels per bar
     const big = Math.max(bmp.width || 0, bmp.height || 0);
-    for (const side of big < 1800 ? [2000, 2800] : [2000, 3200]) {
-      const c = toCanvas(bmp, side, big < 1800);
+    // nothing at all after the usual sizes: two in-between sizes (a barcode can sit right at a sampling edge)
+    for (const side of big < 1800 ? [2000, 2800, 2400, 1600] : [2000, 3200, 1600, 2400]) {
+      if ((side === 1600 || side === 2400) && seen.size) break;
+      const c = toCanvas(bmp, side, big < 1800 || side === 2400);
       if (!first) first = c;
       const res = await readBarcodes(c.getContext("2d").getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 40, formats: LABEL_FORMATS });
       for (const r of res) if (r.isValid !== false && r.text) seen.set(r.format + "|" + r.text, { format: r.format, text: r.text, pos: relPos(r.position, c.width, c.height) });
       const has2D = [...seen.values()].some((r) => /DataMatrix|QR|PDF417|Aztec/.test(r.format));
-      if (has2D || (big >= 1800 && big <= side) || (big < 1800 && seen.size >= 3)) break;
+      if (has2D || (seen.size && big >= 1800 && side >= 3200) || (big < 1800 && seen.size >= 3)) break;
     }
     // stripe barcodes only: look again close-up around each one — neighbours with thin bars (Code 39 on TE/Deutsch
     // bags, behind glare) often only decode from an enlarged crop
@@ -392,6 +396,7 @@ async function decodeFile(file, { decode = true } = {}) {
         }
       }
     }
+    if (window.__OCR_DEBUG) window.__codes = [...seen.values()].map((c) => c.format + ": " + c.text);
   } else first = toCanvas(bmp, 2000);
   const ocrCanvas = ocrAvailable() ? toCanvas(bmp, 2600, Math.max(bmp.width || 0, bmp.height || 0) < 1800) : null;
   const photo = await canvasBlob(toCanvas(first, 1600));
@@ -582,6 +587,7 @@ const MPN_VALUE = /[:;]?\s*([A-Z0-9][A-Z0-9 \-\/.,#+_()]{2,40})\s*$/i;
 function cleanMpn(v) {
   let t = String(v || "").trim().replace(/[@Ø]/g, "0").replace(/^[\[\/](?=\d[A-Z0-9])/i, "7").replace(/^[^A-Z0-9]+/i, "").replace(/[^A-Z0-9)]+$/i, "");
   if (/^\d{1,2}-[A-Z]{3}-\d{2,4}/i.test(t) || /^\d+$/.test(t.replace(/[\s\-.]/g, "")) || /-N[D0O]$/i.test(t)) return ""; // dates, plain numbers, DigiKey numbers
+  if (/\.\.|^\d+([.,]\d+)?\s?[PNUΜµMK]?(F|V|A|W|H|R|Ω|OHM)\b/i.test(t)) return ""; // component values / ranges (3,3pF…0,1µF, 100nF, 16V)
   t = t.replace(/[ .](\d{3})$/, ",$1"); // NXP/Nexperia packing suffix: "74HC2G08DC 125" → "74HC2G08DC,125"
   t = t.replace(/\s+/g, "");
   return t.length >= 3 && /\d/.test(t) && /[A-Z]/i.test(t) ? t.toUpperCase() : "";
@@ -819,12 +825,14 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   };
   put(r.fields2D, "QR code");
   put(r.fields1D, "barcode");
+  // retail packs (Kemo, Velleman, Conrad…): the EAN/UPC barcode is a worldwide product number — keep it as such
+  { const e = (r.all || []).find((c) => /EAN|UPC/i.test(c.format) && /^\d{8,14}$/.test(c.text)); if (e && !merged.ean) { merged.ean = e.text; src.ean = "barcode"; } }
   // a stripe barcode that looks like a part number (letters + digits) and isn't already another field. Longest wins;
   // codes printed sideways along the edge (Mouser's 393M2T-style routing code) are skipped when level ones exist.
   const pnFromBarcodes = () => {
     const used = new Set(Object.values(merged).map(String));
     const flat = (c) => !c.pos || Math.abs((c.pos.tr.x - c.pos.tl.x) * (c.pos.ar || 1)) >= Math.abs(c.pos.tr.y - c.pos.tl.y);
-    const pl = (r.all || []).filter((c) => !is2DFormat(c.format) && !parseFarnellBarcode(c.text));
+    const pl = (r.all || []).filter((c) => !is2DFormat(c.format) && !/EAN|UPC/i.test(c.format) && !parseFarnellBarcode(c.text));
     const lvl = pl.some(flat) ? pl.filter(flat) : pl;
     return lvl.map((c) => String(c.text).trim())
       .filter((v) => !used.has(v) && v.length >= 6 && v.length <= 40 && (v.match(/[A-Z]/gi) || []).length >= 2 && (v.match(/\d/g) || []).length >= 2 && /^[A-Z0-9][A-Z0-9\-\/.#+_,]+$/i.test(v))
@@ -832,7 +840,8 @@ async function handleDecoded(codes, media, mode, opts = {}) {
   };
   // square code without a part number (Mouser China), or loose stripe barcodes (TE/Deutsch Code 39): a barcode that
   // looks like a part number is the part number — no need to read text for it
-  if ((r.has2DData || !r.multi) && !merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
+  // (not on full Farnell labels with many barcodes: there a lot code looks like a part number too — captions decide)
+  if (!merged.mpn && (!r.multi || r.has2DData || (r.oneD || []).length <= 3)) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
   let ocrUsed = false, mpnAgree = 0;
   // the part number is what matters: once a code gave it (square code, or a Farnell label's barcodes with qty), skip
   // reading text — that is what keeps a scan fast
@@ -893,18 +902,19 @@ async function handleDecoded(codes, media, mode, opts = {}) {
       put(t, "text");
       if (merged.supplierPn && src.supplierPn === "text" && U(merged.supplierPn) === U(merged.mpn)) { delete merged.supplierPn; delete src.supplierPn; }
       // still no part number: a stripe barcode that looks like one (letters + digits, e.g. Code 39 *ASX602-06SN-HE-R*)
-      if (!merged.mpn) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
+      // (not on full Farnell labels with many barcodes: there a lot code looks like a part number too — captions decide)
+  if (!merged.mpn && (!r.multi || r.has2DData || (r.oneD || []).length <= 3)) { const pn = pnFromBarcodes(); if (pn) { merged.mpn = pn; src.mpn = "barcode"; } }
       ocrUsed = Object.values(src).some((v) => v.includes("text")) || !!r.captionsSeen;
     } catch (e) { console.warn("ocr", e); if (!opts.live) toast("Couldn't load the text reader — using the barcodes only.", "err"); }
   }
   if (!merged.supplier && /^\d{7}$/.test(merged.supplierPn || "") && (merged.mpn || merged.order)) { merged.supplier = "Farnell"; src.supplier = src.supplierPn; }
   if (Object.keys(merged).length && (!r.primary || r.primary.startsWith("L|") || (!r.has2DData && !r.known1D)))
-    r.primary = ["L", merged.supplierPn, merged.mpn, merged.lot, merged.dateCode, merged.qty].map((x) => x ?? "").join("|");
+    r.primary = ["L", merged.supplierPn || merged.ean, merged.mpn, merged.lot, merged.dateCode, merged.qty].map((x) => x ?? "").join("|");
   const readFrom = Object.keys(src).length ? src : null;
   // a read from codes always counts; text alone must give at least two part fields (a stray word on the bag is not a part)
   const fromCode = Object.values(src).some((v) => /QR|barcode/.test(v));
   const textHits = ["mpn", "supplierPn", "qty", "description"].filter((k) => merged[k] != null && merged[k] !== "").length;
-  const found = fromCode ? !!(merged.mpn || merged.supplierPn || merged.description || merged.order) : textHits >= 2;
+  const found = fromCode ? !!(merged.mpn || merged.supplierPn || merged.ean || merged.description || merged.order) : textHits >= 2;
 
   // 4) nothing readable: manual entry (photo kept so it can be typed from it later)
   let loose = mode === "loose";
@@ -1097,7 +1107,7 @@ async function openLive() {
     c.width = Math.round(video.videoWidth * sc); c.height = Math.round(video.videoHeight * sc);
     ctx.drawImage(video, 0, 0, c.width, c.height);
     let res;
-    try { res = await readBarcodes(ctx.getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 6, formats: ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128"] }); } catch { continue; }
+    try { res = await readBarcodes(ctx.getImageData(0, 0, c.width, c.height), { tryHarder: true, maxNumberOfSymbols: 8, formats: ["DataMatrix", "QRCode", "MicroQRCode", "PDF417", "Aztec", "Code128", "Code39", "EAN-13", "EAN-8", "UPC-A"] }); } catch { continue; }
     const codes = res.filter((x) => x.isValid !== false && x.text).map((x) => ({ format: x.format, text: x.text, pos: relPos(x.position, c.width, c.height) }));
     if (window.__LIVE_DEBUG) { window.__liveLog = (window.__liveLog || []).concat([[c.width, codes.map((x) => x.text).join(",")]]).slice(-12); if (!window.__frame) window.__frame = c.toDataURL("image/png"); }
     if (!codes.length) continue;
@@ -1123,9 +1133,11 @@ async function openLive() {
       if (r.boxCode !== currentBox) { await handleDecoded(codes, null, "bag", { live: true }); beep(660); flash(`Now filling ${r.boxCode}`, "box"); updInfo(); }
       continue;
     }
-    if (!r.partRef && !r.has2DData && !r.known1D) continue;
+    // retail packs (EAN/UPC barcode only, e.g. Kemo): take the EAN and read the part number from the text once
+    const retail = !r.has2DData && !r.known1D && codes.some((c) => /EAN|UPC/i.test(c.format));
+    if (!r.partRef && !r.has2DData && !r.known1D && !retail) continue;
     // multi-barcode label still missing its part-number barcode: wait up to 4 s, then read the part-number line as text
-    let readPnLine = false;
+    let readPnLine = retail;
     const wk = r.multi?.fields.supplierPn ? "sp:" + r.multi.fields.supplierPn : ""; // frames catch different barcodes: key on the order code
     if (wk && !r.multi.fields.mpn) {
       const t0 = waitPn.get(wk) || now; waitPn.set(wk, t0);
@@ -1153,6 +1165,7 @@ async function openLive() {
     if (readPnLine) flash("Reading the part number text…", "box");
     const out = await handleDecoded(codes, media, "bag", { live: true, mpnLine: readPnLine });
     waitPn.delete(key); if (wk) waitPn.delete(wk);
+    lastSeen.set(key, Date.now()); // reading text can take seconds: the "same bag in view" window starts after it
     if (out?.kind === "added") {
       count++; beep(880); flash("✓ " + out.text, "ok"); lastLive = out.item;
       for (const x of codes) codeOwner.set(x.text, { key, at: Date.now() }); // later partial reads of this label are the same bag
@@ -1326,7 +1339,7 @@ function buildWorkbook() {
   const OLD = `Earlier count (before ${COUNT_CUTOFF_TXT}, NOT reliable)`;
   const rowOf = (i) => ({
     List: LISTS[listOf(i)].name, Box: i.box || "", "Box name": box(i.box).name || "", Location: box(i.box).location || "", Category: i.category || "", Description: i.description || "",
-    Manufacturer: i.manufacturer || "", "Manufacturer PN": i.mpn || "", Supplier: i.supplier || "", "Supplier PN": i.supplierPn || "",
+    Manufacturer: i.manufacturer || "", "Manufacturer PN": i.mpn || "", Supplier: i.supplier || "", "Supplier PN": i.supplierPn || "", "EAN / retail barcode": i.ean || "",
     "COUNTED QTY (actual)": status(i) === "Counted" ? Number(i.count) : "", "Count status": status(i),
     "Counted by": i.countedBy && status(i) !== "Not counted yet" ? realName(i.countedBy) : "", "Counted at": i.countedAt && status(i) !== "Not counted yet" ? new Date(i.countedAt).toLocaleString() : "",
     "Label qty (scanned, NOT verified)": i.qty === "" || i.qty == null ? "" : Number(i.qty),
@@ -1362,7 +1375,7 @@ function buildWorkbook() {
 
   const agg = new Map();
   for (const i of state.items) {
-    const key = listOf(i) + "|" + U(i.mpn || i.description || i.supplierPn || "(unknown)");
+    const key = listOf(i) + "|" + U(i.mpn || i.ean || i.description || i.supplierPn || "(unknown)");
     const a = agg.get(key) || { List: LISTS[listOf(i)].name, "Manufacturer PN": i.mpn || "", Description: i.description || "", Category: i.category || "", Manufacturer: i.manufacturer || "",
       "COUNTED total (actual)": 0, "Bags counted": 0, "Bags can't count": 0, "Bags not counted yet": 0, Bags: 0, "Count complete": "", "Label qty total (NOT verified)": 0, [`Earlier counts total (before ${COUNT_CUTOFF_TXT}, NOT reliable)`]: 0, Boxes: new Set() };
     const st = status(i);
@@ -1634,7 +1647,7 @@ function filteredItems() {
   if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
   if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
   if (filterFlag === "nodesc") items = items.filter((i) => !i.description);
-  if (qs) items = items.filter((i) => [i.description, i.mpn, i.manufacturer, i.supplierPn, i.category, i.notes, i.box].some((v) => String(v || "").toLowerCase().includes(qs)));
+  if (qs) items = items.filter((i) => [i.description, i.mpn, i.manufacturer, i.supplierPn, i.ean, i.category, i.notes, i.box].some((v) => String(v || "").toLowerCase().includes(qs)));
   return items.sort((a, b) => (b.at || 0) - (a.at || 0));
 }
 function itemsBody() {
@@ -1659,7 +1672,7 @@ function viewItems() {
   if (filterFlag === "check") items = items.filter((i) => i.needsCheck || i.ai === "failed");
   if (filterFlag === "label") items = items.filter((i) => i.needsLabel && !i.labelPrinted);
   if (filterFlag === "nodesc") items = items.filter((i) => !i.description);
-  if (qs) items = items.filter((i) => [i.description, i.mpn, i.manufacturer, i.supplierPn, i.category, i.notes, i.box].some((v) => String(v || "").toLowerCase().includes(qs)));
+  if (qs) items = items.filter((i) => [i.description, i.mpn, i.manufacturer, i.supplierPn, i.ean, i.category, i.notes, i.box].some((v) => String(v || "").toLowerCase().includes(qs)));
   items.sort((a, b) => (b.at || 0) - (a.at || 0));
   const total = items.reduce((s, i) => s + (Number(i.qty) || 0), 0);
   const boxSel = boxSelect(filterBox, (v) => { filterBox = v; emit(); }, { empty: "All boxes" });
